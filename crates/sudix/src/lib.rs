@@ -23,7 +23,7 @@ pub mod protocol;
 pub mod scoping;
 pub mod server;
 
-pub use approval::{Approver, TotpApprover, ZenityApprover, approver_for};
+pub use approval::{Approver, TotpApprover, approver_for, prompt_text, spawn_zenity};
 pub use config::ConfigError;
 pub use policy::{Policy, Rule, Verdict};
 pub use protocol::{Request, Response};

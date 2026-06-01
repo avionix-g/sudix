@@ -274,6 +274,7 @@ fn spawn_agent_broker(
         let approver = AgentApprover {
             registry: Arc::clone(&registry2),
             register_wait: Duration::from_millis(200),
+            approval_gate: Arc::new(std::sync::Mutex::new(())),
         };
         drop(serve_on_with_registry(
             &listener, &cfg, &approver, &registry2,
@@ -318,7 +319,6 @@ fn agent_allows_command_end_to_end() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
     let (socket, _registry) = spawn_agent_broker(dir.path(), uid);
-    // Give the broker a moment to accept the agent's registration.
     register_fake_agent(&socket, Verdict::Allow);
 
     match send(&socket, &req(&["echo", "agent-allow"])) {
@@ -350,7 +350,7 @@ fn agent_denies_command_end_to_end() {
 fn no_agent_command_returns_response_error() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    // spawn_agent_broker uses a 5s wait, but we don't register any agent
+    // spawn_agent_broker uses a 200ms register_wait; we don't register any agent
     let (socket, _registry) = spawn_agent_broker(dir.path(), uid);
 
     match send(&socket, &req(&["echo", "no-agent"])) {

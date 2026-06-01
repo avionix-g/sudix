@@ -7,36 +7,11 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use sudix::approval::shell_join;
-use sudix::protocol::{Hello, Prompt, Verdict};
-
-fn prompt_text(p: &Prompt) -> String {
-    format!(
-        "A coding agent is requesting root to run:\n\n\
-         {}\n\n\
-         Working directory: {}\n\
-         Reason: {}\n\n\
-         Allow this single command to run as root?",
-        shell_join(&p.argv),
-        p.cwd,
-        p.reason,
-    )
-}
-
-/// Map a zenity spawn result + exit status to a Verdict.
-fn zenity_result_to_verdict(result: std::io::Result<std::process::ExitStatus>) -> Verdict {
-    match result {
-        Ok(s) if s.success() => Verdict::Allow,
-        Ok(_) => Verdict::Deny,
-        Err(e) => Verdict::Error {
-            why: format!("zenity spawn failed: {e}"),
-        },
-    }
-}
+use sudix::protocol::{Hello, Prompt};
 
 fn run_agent(socket_path: &str) -> Result<(), String> {
     let mut stream = UnixStream::connect(socket_path)
@@ -71,18 +46,7 @@ fn run_agent(socket_path: &str) -> Result<(), String> {
             }
         };
 
-        let verdict = zenity_result_to_verdict(
-            Command::new("zenity")
-                .arg("--question")
-                .arg("--no-markup")
-                .arg("--title=sudix: root access requested")
-                .arg(format!("--text={}", prompt_text(&prompt)))
-                .arg("--ok-label=Allow")
-                .arg("--cancel-label=Deny")
-                .arg("--default-cancel")
-                .arg("--width=500")
-                .status(),
-        );
+        let verdict = sudix::approval::spawn_zenity(&prompt);
 
         let v_line = match verdict.to_line() {
             Ok(l) => l,
@@ -124,37 +88,4 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::ExitStatus;
-
-    fn exit(code: i32) -> ExitStatus {
-        ExitStatus::from_raw(code << 8)
-    }
-
-    fn spawn_fail() -> std::io::Result<ExitStatus> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "zenity not found",
-        ))
-    }
-
-    #[test]
-    fn exit_zero_maps_to_allow() {
-        assert_eq!(zenity_result_to_verdict(Ok(exit(0))), Verdict::Allow);
-    }
-
-    #[test]
-    fn exit_nonzero_maps_to_deny() {
-        assert_eq!(zenity_result_to_verdict(Ok(exit(1))), Verdict::Deny);
-    }
-
-    #[test]
-    fn spawn_failure_maps_to_error() {
-        assert!(matches!(
-            zenity_result_to_verdict(spawn_fail()),
-            Verdict::Error { .. }
-        ));
-    }
-}
+mod tests {}

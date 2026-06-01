@@ -118,6 +118,10 @@ impl Hello {
 }
 
 /// A prompt sent from the broker to a registered agent, asking for a verdict.
+///
+/// This is intentionally the displayable subset of [`Request`], sans secrets:
+/// `otp` is deliberately omitted so the TOTP code is never forwarded to the
+/// agent dialog (and cannot be harvested from it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prompt {
     pub argv: Vec<String>,

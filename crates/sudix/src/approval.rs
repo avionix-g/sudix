@@ -6,10 +6,10 @@
 //! answer denies the request.
 //!
 //! The [`Approver`] trait exists so the server can be driven by a scripted
-//! approver in tests; production uses [`ZenityApprover`] or [`TotpApprover`].
+//! approver in tests; production uses [`AgentApprover`] or [`TotpApprover`].
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
@@ -39,20 +39,45 @@ pub trait Approver: Send + Sync {
     fn clone_box(&self) -> Box<dyn Approver>;
 }
 
-/// Renders the message a human sees. Kept separate from the dialog mechanism so
-/// it can be unit-tested without spawning anything.
+/// Renders the message a human sees for a given prompt. Kept separate from the
+/// dialog mechanism so it can be unit-tested without spawning anything.
 #[must_use]
-pub fn prompt_text(req: &Request) -> String {
+pub fn prompt_text(p: &Prompt) -> String {
     format!(
         "A coding agent is requesting root to run:\n\n\
          {}\n\n\
          Working directory: {}\n\
          Reason: {}\n\n\
          Allow this single command to run as root?",
-        shell_join(&req.argv),
-        req.cwd,
-        req.reason,
+        shell_join(&p.argv),
+        p.cwd,
+        p.reason,
     )
+}
+
+/// Spawn a zenity question dialog for the given prompt and return the verdict.
+///
+/// Uses `--no-markup` to prevent agent-controlled fields from injecting Pango
+/// markup into the dialog text.
+#[must_use]
+pub fn spawn_zenity(p: &Prompt) -> Verdict {
+    match Command::new("zenity")
+        .arg("--question")
+        .arg("--no-markup")
+        .arg("--title=sudix: root access requested")
+        .arg(format!("--text={}", prompt_text(p)))
+        .arg("--ok-label=Allow")
+        .arg("--cancel-label=Deny")
+        .arg("--default-cancel")
+        .arg("--width=500")
+        .status()
+    {
+        Ok(s) if s.success() => Verdict::Allow,
+        Ok(_) => Verdict::Deny,
+        Err(e) => Verdict::Error {
+            why: format!("zenity spawn failed: {e}"),
+        },
+    }
 }
 
 /// Join argv into a display string. This is for *human display only* — it is
@@ -70,39 +95,6 @@ pub fn shell_join(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Production approver: a `zenity --question` dialog.
-#[derive(Debug, Default, Clone)]
-pub struct ZenityApprover;
-
-impl Approver for ZenityApprover {
-    fn approve(&self, _caller_uid: u32, req: &Request) -> Approval {
-        // zenity exits 0 for the OK/Allow button, non-zero for Cancel/Deny,
-        // window-close, and timeout.
-        //
-        // --no-markup: suppress Pango markup interpretation so agent-controlled
-        // reason/cwd fields cannot inject styled or misleading text.
-        match Command::new("zenity")
-            .arg("--question")
-            .arg("--no-markup")
-            .arg("--title=sudix: root access requested")
-            .arg(format!("--text={}", prompt_text(req)))
-            .arg("--ok-label=Allow")
-            .arg("--cancel-label=Deny")
-            .arg("--default-cancel")
-            .arg("--width=500")
-            .status()
-        {
-            Ok(s) if s.success() => Approval::Allowed,
-            Ok(_) => Approval::Denied,
-            Err(e) => Approval::Error(format!("zenity spawn failed: {e}")),
-        }
-    }
-
-    fn clone_box(&self) -> Box<dyn Approver> {
-        Box::new(Self)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +230,9 @@ pub fn approver_for(
 
 /// Timeout for a single prompt round-trip (user has this long to click).
 const AGENT_PROMPT_TIMEOUT_SECS: u64 = 300;
+/// Maximum bytes read from a verdict line. A verdict is tiny; capping prevents
+/// a buggy/wedged agent from buffering unboundedly while holding the gate.
+const MAX_VERDICT_BYTES: u64 = 4096;
 
 /// A live connection to a registered per-user approval agent.
 pub struct AgentHandle {
@@ -298,7 +293,7 @@ impl AgentHandle {
         {
             return Approval::Error(format!("set_read_timeout failed: {e}"));
         }
-        let mut reader = BufReader::new(&*guard);
+        let mut reader = BufReader::new((&*guard).take(MAX_VERDICT_BYTES));
         let mut verdict_line = String::new();
         match reader.read_line(&mut verdict_line) {
             Err(e) => {
@@ -323,18 +318,23 @@ impl AgentHandle {
 /// Shared registry: maps uid → live agent connection.
 pub type AgentRegistry = (Mutex<HashMap<u32, Arc<AgentHandle>>>, Condvar);
 
+const NO_AGENT_MSG: &str = "no approval agent running in your session; is sudix-agent running?";
+
 /// Approver that routes each prompt to the registered per-user agent.
 pub struct AgentApprover {
     pub registry: Arc<AgentRegistry>,
     /// How long to wait for an agent to register before returning an error.
     pub register_wait: Duration,
+    /// Serializes the dialog step: taken only after the registration wait so
+    /// waiting for the agent does not block concurrent requests from other uids.
+    pub approval_gate: Arc<Mutex<()>>,
 }
 
 impl Approver for AgentApprover {
     fn approve(&self, caller_uid: u32, req: &Request) -> Approval {
         let (ref lock, ref cv) = *self.registry;
 
-        // Wait up to register_wait for the agent to appear.
+        // Phase 1: wait for the agent to appear — no approval gate held.
         let deadline = std::time::Instant::now() + self.register_wait;
         let handle = loop {
             let guard = lock
@@ -345,17 +345,13 @@ impl Approver for AgentApprover {
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Approval::Error(
-                    "no approval agent running in your session; is sudix-agent running?".into(),
-                );
+                return Approval::Error(NO_AGENT_MSG.into());
             }
             let (_guard, timed_out) = cv
                 .wait_timeout(guard, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if timed_out.timed_out() {
-                return Approval::Error(
-                    "no approval agent running in your session; is sudix-agent running?".into(),
-                );
+                return Approval::Error(NO_AGENT_MSG.into());
             }
         };
 
@@ -364,6 +360,12 @@ impl Approver for AgentApprover {
             cwd: req.cwd.clone(),
             reason: req.reason.clone(),
         };
+
+        // Phase 2: gate the dialog itself so at most one dialog shows at a time.
+        let _gate = self
+            .approval_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         handle.prompt(&prompt)
     }
 
@@ -371,6 +373,7 @@ impl Approver for AgentApprover {
         Box::new(Self {
             registry: Arc::clone(&self.registry),
             register_wait: self.register_wait,
+            approval_gate: Arc::clone(&self.approval_gate),
         })
     }
 }
@@ -391,7 +394,13 @@ mod tests {
 
     #[test]
     fn prompt_shows_the_exact_command() {
-        let text = prompt_text(&req());
+        let r = req();
+        let p = Prompt {
+            argv: r.argv.clone(),
+            cwd: r.cwd.clone(),
+            reason: r.reason.clone(),
+        };
+        let text = prompt_text(&p);
         assert!(text.contains("pacman -S ripgrep"));
         assert!(text.contains("Reason: demo"));
         assert!(text.contains("as root"));
@@ -551,6 +560,7 @@ mod tests {
         let approver = AgentApprover {
             registry,
             register_wait: Duration::from_millis(50),
+            approval_gate: Arc::new(Mutex::new(())),
         };
         assert_eq!(approver.approve(1000, &agent_req()), Approval::Allowed);
     }
@@ -570,6 +580,7 @@ mod tests {
         let approver = AgentApprover {
             registry,
             register_wait: Duration::from_millis(50),
+            approval_gate: Arc::new(Mutex::new(())),
         };
         assert_eq!(approver.approve(1000, &agent_req()), Approval::Denied);
     }
@@ -594,6 +605,7 @@ mod tests {
         let approver = AgentApprover {
             registry,
             register_wait: Duration::from_millis(50),
+            approval_gate: Arc::new(Mutex::new(())),
         };
         assert!(matches!(
             approver.approve(1000, &agent_req()),
@@ -607,6 +619,7 @@ mod tests {
         let approver = AgentApprover {
             registry,
             register_wait: Duration::from_millis(50),
+            approval_gate: Arc::new(Mutex::new(())),
         };
         let result = approver.approve(1000, &agent_req());
         assert!(matches!(result, Approval::Error(_)));

@@ -272,11 +272,22 @@ pub fn serve_on_with_registry(
     base_approver: &dyn Approver,
     registry: &Arc<AgentRegistry>,
 ) -> io::Result<()> {
+    // For the agent path, approval serialization is managed by AgentApprover's
+    // own gate — no outer mutex is needed here.
+    serve_on_with_registry_inner(listener, cfg, base_approver, registry, None);
+    Ok(())
+}
+
+fn serve_on_with_registry_inner(
+    listener: &UnixListener,
+    cfg: &Config,
+    base_approver: &dyn Approver,
+    registry: &Arc<AgentRegistry>,
+    outer_approval_gate: Option<&Arc<Mutex<()>>>,
+) {
     let cfg = Arc::new(cfg.clone());
     let base_approver: Arc<dyn Approver> = Arc::from(base_approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
-    // Serializes the blocking human-approval step so only one dialog shows at a time.
-    let approval_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     // Counting semaphore: limits concurrent threads to MAX_CONCURRENT.
     let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0usize), Condvar::new()));
 
@@ -304,9 +315,9 @@ pub fn serve_on_with_registry(
         let cfg2 = Arc::clone(&cfg);
         let base_approver2 = Arc::clone(&base_approver);
         let state2 = Arc::clone(&state);
-        let amtx2 = Arc::clone(&approval_mutex);
         let sem2 = Arc::clone(&sem);
         let registry2 = Arc::clone(registry);
+        let gate2 = outer_approval_gate.map(Arc::clone);
 
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -314,7 +325,7 @@ pub fn serve_on_with_registry(
                     &cfg2,
                     &*base_approver2,
                     &state2,
-                    &amtx2,
+                    gate2.as_deref(),
                     &registry2,
                     &stream,
                 ) {
@@ -333,7 +344,6 @@ pub fn serve_on_with_registry(
             cvar.notify_one();
         });
     }
-    Ok(())
 }
 
 /// Serve connections on an already-bound listener.
@@ -360,22 +370,27 @@ pub fn serve_on(
     base_approver: &dyn Approver,
 ) -> io::Result<()> {
     let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
-    serve_on_with_registry(listener, cfg, base_approver, &registry)
+    // Serializes the blocking human-approval step so at most one dialog is
+    // outstanding at a time. AgentApprover manages its own gate internally.
+    let gate = Arc::new(Mutex::new(()));
+    serve_on_with_registry_inner(listener, cfg, base_approver, &registry, Some(&gate));
+    Ok(())
 }
 
-/// Lock the socket to owner-only access (0600). Defense in depth: the peer-cred
-/// check is the real gate, but there is no reason for the socket to be group-
-/// or world-reachable.
+/// Set the socket mode to 0666. Authorization is by peer-cred (`SO_PEERCRED`),
+/// not by filesystem permission — the mode only controls who may *attempt* a
+/// connection, and non-root callers (including sudix-agent) need to reach it.
+/// 0666 here matches the systemd SocketMode=0666 so both code paths agree.
 fn restrict_socket_permissions(path: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
 }
 
 fn handle_connection_threaded(
     cfg: &Config,
     base_approver: &dyn Approver,
     state: &Mutex<ApprovalState>,
-    approval_mutex: &Mutex<()>,
+    approval_mutex: Option<&Mutex<()>>,
     registry: &Arc<AgentRegistry>,
     stream: &UnixStream,
 ) -> io::Result<()> {
@@ -409,7 +424,7 @@ fn handle_connection_threaded(
                 caller_uid,
                 base_approver,
                 state,
-                Some(approval_mutex),
+                approval_mutex,
                 &clock,
                 &req,
             );
@@ -733,6 +748,7 @@ mod tests {
         let approver = AgentApprover {
             registry,
             register_wait: Duration::from_millis(50),
+            approval_gate: Arc::new(Mutex::new(())),
         };
         let state = no_scoping();
         let resp = handle_request(

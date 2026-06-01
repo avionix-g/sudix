@@ -108,6 +108,7 @@ fn run_daemon() -> std::io::Result<()> {
         let approver = AgentApprover {
             registry: std::sync::Arc::clone(&registry),
             register_wait: std::time::Duration::from_secs(10),
+            approval_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
 
         if let Some(listener) = try_systemd_listener() {
