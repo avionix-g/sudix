@@ -22,7 +22,7 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use crate::approval::{Approval, Approver};
 use crate::audit::{self, Outcome};
 use crate::policy::{Policy, Verdict};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Hello, Request, Response};
 use crate::scoping::{self, ApprovalState, Clock, RealClock, RuleScope};
 
 /// Runtime configuration for the daemon.
@@ -353,8 +353,8 @@ fn handle_connection_threaded(
     }
 
     let clock = RealClock;
-    let resp = match Request::from_line(&line) {
-        Ok(req) => handle_request(
+    let resp = match Hello::from_line(&line) {
+        Ok(Hello::Command(req)) => handle_request(
             cfg,
             caller_uid,
             approver,
@@ -363,6 +363,12 @@ fn handle_connection_threaded(
             &clock,
             &req,
         ),
+        Ok(Hello::RegisterAgent) => {
+            // Agent registration is handled in Step 3; stub for now.
+            Response::Error {
+                why: "agent registration not yet implemented".into(),
+            }
+        }
         Err(e) => Response::Denied {
             why: format!("malformed request: {e}"),
         },

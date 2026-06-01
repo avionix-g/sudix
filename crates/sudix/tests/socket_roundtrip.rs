@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use sudix::approval::{Approval, Approver};
 use sudix::policy::{Policy, Rule};
-use sudix::protocol::{Request, Response};
+use sudix::protocol::{Hello, Request, Response};
 use sudix::scoping::RuleScope;
 use sudix::server::{Config, serve};
 
@@ -94,7 +94,9 @@ fn wait_for_socket(path: &std::path::Path) {
 
 fn send(socket: &std::path::Path, req: &Request) -> Response {
     let mut stream = UnixStream::connect(socket).expect("connect");
-    stream.write_all(req.to_line().unwrap().as_bytes()).unwrap();
+    stream
+        .write_all(Hello::Command(req.clone()).to_line().unwrap().as_bytes())
+        .unwrap();
     stream.flush().unwrap();
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();

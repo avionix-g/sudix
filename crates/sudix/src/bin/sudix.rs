@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
-use sudix::protocol::{Request, Response};
+use sudix::protocol::{Hello, Request, Response};
 
 struct Args {
     reason: String,
@@ -72,7 +72,7 @@ fn run() -> Result<i32, String> {
 
     let mut stream = UnixStream::connect(&socket_path)
         .map_err(|e| format!("cannot reach broker at {socket_path}: {e}"))?;
-    let line = req.to_line().map_err(|e| e.to_string())?;
+    let line = Hello::Command(req).to_line().map_err(|e| e.to_string())?;
     stream
         .write_all(line.as_bytes())
         .map_err(|e| e.to_string())?;

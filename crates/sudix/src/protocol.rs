@@ -85,6 +85,95 @@ impl Response {
     }
 }
 
+/// The first line sent by a client on every new connection, declaring its role.
+///
+/// - `Command` is the existing one-shot flow: send a request, get a response.
+/// - `RegisterAgent` starts a persistent approver session; the uid is taken
+///   from `SO_PEERCRED` and no further auth data is needed on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Hello {
+    Command(Request),
+    RegisterAgent,
+}
+
+impl Hello {
+    /// Serialize to a single newline-terminated JSON line.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn to_line(&self) -> Result<String, serde_json::Error> {
+        let mut s = serde_json::to_string(self)?;
+        s.push('\n');
+        Ok(s)
+    }
+
+    /// Parse from a single JSON line (trailing newline optional).
+    ///
+    /// # Errors
+    /// Returns an error if the line is not valid JSON for a [`Hello`].
+    pub fn from_line(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line.trim_end())
+    }
+}
+
+/// A prompt sent from the broker to a registered agent, asking for a verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Prompt {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub reason: String,
+}
+
+impl Prompt {
+    /// Serialize to a single newline-terminated JSON line.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn to_line(&self) -> Result<String, serde_json::Error> {
+        let mut s = serde_json::to_string(self)?;
+        s.push('\n');
+        Ok(s)
+    }
+
+    /// Parse from a single JSON line (trailing newline optional).
+    ///
+    /// # Errors
+    /// Returns an error if the line is not valid JSON for a [`Prompt`].
+    pub fn from_line(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line.trim_end())
+    }
+}
+
+/// The agent's response to a [`Prompt`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Verdict {
+    Allow,
+    Deny,
+    Error { why: String },
+}
+
+impl Verdict {
+    /// Serialize to a single newline-terminated JSON line.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn to_line(&self) -> Result<String, serde_json::Error> {
+        let mut s = serde_json::to_string(self)?;
+        s.push('\n');
+        Ok(s)
+    }
+
+    /// Parse from a single JSON line (trailing newline optional).
+    ///
+    /// # Errors
+    /// Returns an error if the line is not valid JSON for a [`Verdict`].
+    pub fn from_line(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line.trim_end())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +251,52 @@ mod tests {
         };
         let line = req.to_line().unwrap();
         assert!(!line.contains("otp"));
+    }
+
+    #[test]
+    fn hello_command_round_trips() {
+        let req = Request {
+            argv: vec!["pacman".into(), "-S".into(), "ripgrep".into()],
+            cwd: "/home/adam".into(),
+            reason: "install".into(),
+            otp: None,
+        };
+        let hello = Hello::Command(req.clone());
+        let line = hello.to_line().unwrap();
+        assert!(line.contains("\"kind\":\"command\""));
+        assert_eq!(Hello::from_line(&line).unwrap(), hello);
+    }
+
+    #[test]
+    fn hello_register_agent_round_trips() {
+        let hello = Hello::RegisterAgent;
+        let line = hello.to_line().unwrap();
+        assert!(line.contains("\"kind\":\"register_agent\""));
+        assert_eq!(Hello::from_line(&line).unwrap(), hello);
+    }
+
+    #[test]
+    fn prompt_round_trips() {
+        let p = Prompt {
+            argv: vec!["id".into()],
+            cwd: "/".into(),
+            reason: "test".into(),
+        };
+        let line = p.to_line().unwrap();
+        assert_eq!(Prompt::from_line(&line).unwrap(), p);
+    }
+
+    #[test]
+    fn verdict_variants_round_trip() {
+        for v in [
+            Verdict::Allow,
+            Verdict::Deny,
+            Verdict::Error { why: "oops".into() },
+        ] {
+            let line = v.to_line().unwrap();
+            assert_eq!(Verdict::from_line(&line).unwrap(), v);
+        }
+        assert!(Verdict::Allow.to_line().unwrap().contains("\"verdict\":\"allow\""));
+        assert!(Verdict::Deny.to_line().unwrap().contains("\"verdict\":\"deny\""));
     }
 }
