@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
@@ -12,6 +13,7 @@ use crate::approval::Approver;
 use crate::audit;
 use crate::policy::{Policy, Verdict};
 use crate::protocol::{Request, Response};
+use crate::scoping::{self, ApprovalState, Clock, RealClock, RuleScope};
 
 /// Runtime configuration for the daemon.
 pub struct Config {
@@ -22,6 +24,8 @@ pub struct Config {
     pub agent_uids: Vec<u32>,
     /// The authorization policy.
     pub policy: Policy,
+    /// Per-rule scoping (cache TTL and rate limit); indexed parallel to allow rules.
+    pub rule_scopes: Vec<RuleScope>,
     /// Append-only audit log path.
     pub audit_path: PathBuf,
 }
@@ -39,6 +43,8 @@ pub fn handle_request(
     cfg: &Config,
     caller_uid: u32,
     approver: &dyn Approver,
+    approval_state: &Mutex<ApprovalState>,
+    clock: &dyn Clock,
     req: &Request,
 ) -> Response {
     if req.argv.is_empty() {
@@ -48,13 +54,13 @@ pub fn handle_request(
         };
     }
 
-    match cfg.policy.evaluate(&req.argv) {
+    let rule_index = match cfg.policy.evaluate(&req.argv) {
         Verdict::Denied { reason } => {
             audit_best_effort(cfg, caller_uid, req, "denied-policy");
             return Response::Denied { why: reason };
         }
-        Verdict::Allowed => {}
-    }
+        Verdict::Allowed { rule_index } => rule_index,
+    };
 
     // Validate and canonicalize cwd before showing it to the human or using it
     // in exec — the client supplies this value and it must not be trusted raw.
@@ -71,12 +77,56 @@ pub fn handle_request(
         };
     }
 
+    // Rate limiting: checked before prompting.
+    if scoping::is_rate_limited(approval_state, &cfg.rule_scopes, rule_index, clock) {
+        audit_best_effort(cfg, caller_uid, req, "denied-rate");
+        return Response::Denied {
+            why: "rate limit exceeded".into(),
+        };
+    }
+
+    // Cache check: if a fresh approval exists, skip the human dialog.
+    match scoping::check_cache(
+        approval_state,
+        &cfg.rule_scopes,
+        rule_index,
+        &req.argv,
+        clock,
+    ) {
+        scoping::CacheVerdict::Hit => match execute(req, &cwd) {
+            Ok((exit_code, stdout, stderr)) => {
+                audit_best_effort(cfg, caller_uid, req, "approved-cached");
+                return Response::Approved {
+                    exit_code,
+                    stdout,
+                    stderr,
+                };
+            }
+            Err(e) => {
+                audit_best_effort(cfg, caller_uid, req, "execute-error");
+                return Response::Denied {
+                    why: format!("execution failed: {e}"),
+                };
+            }
+        },
+        scoping::CacheVerdict::Miss => {}
+    }
+
     if !approver.approve(req) {
         audit_best_effort(cfg, caller_uid, req, "denied-user");
         return Response::Denied {
             why: "denied by user".into(),
         };
     }
+
+    // Record the approval for cache and rate tracking.
+    scoping::record_approval(
+        approval_state,
+        &cfg.rule_scopes,
+        rule_index,
+        &req.argv,
+        clock,
+    );
 
     match execute(req, &cwd) {
         Ok((exit_code, stdout, stderr)) => {
@@ -136,10 +186,13 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
         cfg.agent_uids
     );
 
+    let state = Arc::new(Mutex::new(ApprovalState::new()));
+    let clock = RealClock;
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                if let Err(e) = handle_connection(cfg, approver, &stream) {
+                if let Err(e) = handle_connection(cfg, approver, &state, &clock, &stream) {
                     eprintln!("sudixd: connection error: {e}");
                 }
             }
@@ -157,7 +210,13 @@ fn restrict_socket_permissions(path: &std::path::Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-fn handle_connection(cfg: &Config, approver: &dyn Approver, stream: &UnixStream) -> io::Result<()> {
+fn handle_connection(
+    cfg: &Config,
+    approver: &dyn Approver,
+    state: &Mutex<ApprovalState>,
+    clock: &dyn Clock,
+    stream: &UnixStream,
+) -> io::Result<()> {
     let caller_uid = peer_uid(stream)?;
     if !cfg.agent_uids.contains(&caller_uid) {
         // Refuse before reading anything from an unauthorized peer.
@@ -174,7 +233,7 @@ fn handle_connection(cfg: &Config, approver: &dyn Approver, stream: &UnixStream)
     }
 
     let resp = match Request::from_line(&line) {
-        Ok(req) => handle_request(cfg, caller_uid, approver, &req),
+        Ok(req) => handle_request(cfg, caller_uid, approver, state, clock, &req),
         Err(e) => Response::Denied {
             why: format!("malformed request: {e}"),
         },
@@ -205,13 +264,20 @@ mod tests {
     use crate::policy::Rule;
     use std::cell::Cell;
 
+    use crate::scoping::{ApprovalState, RealClock};
+
     fn test_cfg(dir: &std::path::Path) -> Config {
         Config {
             socket_path: dir.join("sock"),
             agent_uids: vec![1000],
             policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
+            rule_scopes: vec![],
             audit_path: dir.join("audit.log"),
         }
+    }
+
+    fn no_scoping() -> std::sync::Mutex<ApprovalState> {
+        std::sync::Mutex::new(ApprovalState::new())
     }
 
     /// Approver that always answers a fixed verdict and counts calls, so we can
@@ -251,10 +317,13 @@ mod tests {
             answer: true,
             calls: Cell::new(0),
         };
+        let state = no_scoping();
         let resp = handle_request(
             &cfg,
             1000,
             &approver,
+            &state,
+            &RealClock,
             &req_with_cwd(&["echo", "hi"], "/no/such/directory/ever"),
         );
         assert!(matches!(resp, Response::Denied { .. }));
@@ -272,10 +341,13 @@ mod tests {
             answer: true,
             calls: Cell::new(0),
         };
+        let state = no_scoping();
         let resp = handle_request(
             &cfg,
             1000,
             &approver,
+            &state,
+            &RealClock,
             &req_with_cwd(&["echo", "hi"], file_path.to_str().unwrap()),
         );
         assert!(matches!(resp, Response::Denied { .. }));
@@ -290,7 +362,15 @@ mod tests {
             answer: true,
             calls: Cell::new(0),
         };
-        let resp = handle_request(&cfg, 1000, &approver, &req(&["rm", "-rf", "/"]));
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            &RealClock,
+            &req(&["rm", "-rf", "/"]),
+        );
         assert!(matches!(resp, Response::Denied { .. }));
         // The human must never be bothered for a command policy already refused.
         assert_eq!(approver.calls.get(), 0);
@@ -304,7 +384,15 @@ mod tests {
             answer: false,
             calls: Cell::new(0),
         };
-        let resp = handle_request(&cfg, 1000, &approver, &req(&["echo", "hi"]));
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            &RealClock,
+            &req(&["echo", "hi"]),
+        );
         assert!(matches!(resp, Response::Denied { .. }));
         assert_eq!(approver.calls.get(), 1);
     }
@@ -317,7 +405,15 @@ mod tests {
             answer: true,
             calls: Cell::new(0),
         };
-        let resp = handle_request(&cfg, 1000, &approver, &req(&["echo", "hello"]));
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            &RealClock,
+            &req(&["echo", "hello"]),
+        );
         match resp {
             Response::Approved {
                 exit_code, stdout, ..
@@ -337,8 +433,9 @@ mod tests {
             answer: true,
             calls: Cell::new(0),
         };
-        handle_request(&cfg, 1000, &yes, &req(&["echo", "ok"]));
-        handle_request(&cfg, 1000, &yes, &req(&["dd", "x"])); // policy-denied
+        let state = no_scoping();
+        handle_request(&cfg, 1000, &yes, &state, &RealClock, &req(&["echo", "ok"]));
+        handle_request(&cfg, 1000, &yes, &state, &RealClock, &req(&["dd", "x"])); // policy-denied
         let body = std::fs::read_to_string(&cfg.audit_path).unwrap();
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("executed"));

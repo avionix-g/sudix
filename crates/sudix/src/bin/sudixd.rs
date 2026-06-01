@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use sudix::ZenityApprover;
 use sudix::config::{self, FileConfig};
+use sudix::scoping::RuleScope;
 use sudix::server::{Config, serve};
 
 fn main() -> ExitCode {
@@ -46,10 +47,19 @@ fn main() -> ExitCode {
     };
 
     let runtime_dir = std::env::var("SUDIX_RUNTIME_DIR").unwrap_or_else(|_| "/run/sudix".into());
+    let rule_scopes = file_cfg
+        .rule_scoping()
+        .into_iter()
+        .map(|(ttl, rate)| RuleScope {
+            cache_ttl_secs: ttl,
+            rate_per_min: rate,
+        })
+        .collect();
     let cfg = Config {
         socket_path: PathBuf::from(&runtime_dir).join("sudixd.sock"),
         agent_uids: file_cfg.agent_uids.clone(),
         policy: file_cfg.build_policy(),
+        rule_scopes,
         audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
     };
 

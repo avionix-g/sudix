@@ -29,7 +29,9 @@ pub struct Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Eligible for approval — passes the allowlist and clears the denylist.
-    Allowed,
+    /// `rule_index` is the 0-based index into the policy's allow list; the
+    /// scoping engine uses it to look up per-rule TTL/rate knobs.
+    Allowed { rule_index: usize },
     /// Rejected outright; `reason` is safe to surface to the caller.
     Denied { reason: String },
 }
@@ -130,8 +132,8 @@ impl Policy {
                 reason: format!("`{prog}` is on the hard denylist"),
             };
         }
-        if self.allow.iter().any(|r| r.matches(argv)) {
-            Verdict::Allowed
+        if let Some(idx) = self.allow.iter().position(|r| r.matches(argv)) {
+            Verdict::Allowed { rule_index: idx }
         } else {
             Verdict::Denied {
                 reason: "command does not match any allow rule".into(),
@@ -169,23 +171,23 @@ mod tests {
 
     #[test]
     fn matches_trailing_wildcard() {
-        assert_eq!(
+        assert!(matches!(
             policy().evaluate(&argv(&["pacman", "-S", "ripgrep", "fd"])),
-            Verdict::Allowed
-        );
+            Verdict::Allowed { .. }
+        ));
         // `**` also matches zero trailing args.
-        assert_eq!(
+        assert!(matches!(
             policy().evaluate(&argv(&["pacman", "-S"])),
-            Verdict::Allowed
-        );
+            Verdict::Allowed { .. }
+        ));
     }
 
     #[test]
     fn single_wildcard_requires_exactly_one_arg() {
-        assert_eq!(
+        assert!(matches!(
             policy().evaluate(&argv(&["systemctl", "status", "sshd"])),
-            Verdict::Allowed
-        );
+            Verdict::Allowed { .. }
+        ));
         // Missing the one required arg → denied.
         assert!(matches!(
             policy().evaluate(&argv(&["systemctl", "status"])),
@@ -200,7 +202,10 @@ mod tests {
 
     #[test]
     fn bare_program_rule_rejects_extra_args() {
-        assert_eq!(policy().evaluate(&argv(&["id"])), Verdict::Allowed);
+        assert!(matches!(
+            policy().evaluate(&argv(&["id"])),
+            Verdict::Allowed { .. }
+        ));
         assert!(matches!(
             policy().evaluate(&argv(&["id", "-u"])),
             Verdict::Denied { .. }
@@ -210,10 +215,10 @@ mod tests {
     #[test]
     fn basename_normalization_blocks_path_spoofing() {
         // Absolute path to an allowed program still matches.
-        assert_eq!(
+        assert!(matches!(
             policy().evaluate(&argv(&["/usr/bin/pacman", "-S", "ripgrep"])),
-            Verdict::Allowed
-        );
+            Verdict::Allowed { .. }
+        ));
         // ...and a path to a hard-denied program is still denied.
         assert!(matches!(
             policy().evaluate(&argv(&["/usr/bin/dd", "if=/dev/zero"])),

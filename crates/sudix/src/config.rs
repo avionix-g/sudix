@@ -77,12 +77,31 @@ impl Default for ApprovalConfig {
     }
 }
 
+/// A single allow rule entry in the config file.
+///
+/// Supports both the concise inline-array form (`["pacman", "-S", "**"]`) and
+/// the table form (`{ argv = ["pacman", "-S", "**"], cache_ttl_secs = 300 }`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowEntry {
+    /// The argv token pattern, e.g. `["pacman", "-S", "**"]`.
+    pub argv: Vec<String>,
+    /// After one approval, auto-approve the identical argv for this many
+    /// seconds. `0` (the default) means always prompt.
+    #[serde(default)]
+    pub cache_ttl_secs: u64,
+    /// Maximum number of approvals per minute for this rule. `0` (the default)
+    /// means unlimited.
+    #[serde(default)]
+    pub rate_per_min: u32,
+}
+
 /// On-disk config file schema.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
-    /// Allow rules as token lists, e.g. `[["pacman", "-S", "**"], ...]`.
-    pub allow: Vec<Vec<String>>,
+    /// Allow rules.
+    pub allow: Vec<AllowEntry>,
     /// Hard-denied program basenames.
     pub hard_deny: Vec<String>,
     /// UIDs permitted to submit requests (agent service accounts).
@@ -129,8 +148,8 @@ impl FileConfig {
     /// Validate rule semantics (e.g. `**` placement) and return errors with
     /// their rule index so the operator can locate the offending line quickly.
     fn validate(&self) -> Result<(), ConfigError> {
-        for (i, toks) in self.allow.iter().enumerate() {
-            Rule::new(toks.iter().map(String::as_str))
+        for (i, entry) in self.allow.iter().enumerate() {
+            Rule::new(entry.argv.iter().map(String::as_str))
                 .map_err(|e| ConfigError::Invalid(format!("allow rule {i}: {e}")))?;
         }
 
@@ -178,9 +197,18 @@ impl FileConfig {
         let allow = self
             .allow
             .iter()
-            .map(|toks| Rule::new(toks.iter().map(String::as_str)).expect("already validated"))
+            .map(|e| Rule::new(e.argv.iter().map(String::as_str)).expect("already validated"))
             .collect();
         Policy::new(allow, self.hard_deny.clone())
+    }
+
+    /// Return the scoping parameters (ttl, rate) for each allow rule in order.
+    #[must_use]
+    pub fn rule_scoping(&self) -> Vec<(u64, u32)> {
+        self.allow
+            .iter()
+            .map(|e| (e.cache_ttl_secs, e.rate_per_min))
+            .collect()
     }
 }
 
@@ -223,17 +251,6 @@ pub fn default_config_toml() -> String {
 #   sudo chown root:root /etc/sudix/policy.toml
 #   sudo chmod 644 /etc/sudix/policy.toml   # or 640; not 666/664
 
-# Allow rules: each entry is an argv token list. The first token is the
-# program basename; `*` matches one argument; `**` matches zero-or-more
-# trailing arguments (only valid as the last token).
-allow = [
-  ["pacman", "-S", "**"],
-  ["pacman", "-Syu", "**"],
-  ["systemctl", "status", "*"],
-  ["systemctl", "restart", "*"],
-  ["id"],
-]
-
 # Programs refused regardless of allow rules. Extend as needed.
 hard_deny = [
   "sh", "bash", "zsh", "fish",
@@ -254,6 +271,29 @@ approver_uids = [1000]
 # "zenity" (desktop dialog) or "totp" (headless; also set totp_secret_path).
 method = "zenity"
 # totp_secret_path = "/etc/sudix/totp.key"   # required when method = "totp"
+
+# Allow rules. Each entry must have an `argv` token list. The first token is
+# the program basename; `*` matches one argument; `**` matches zero-or-more
+# trailing arguments (only valid as the last token).
+#
+# Optional per-rule scoping knobs (both default to 0 = "off"):
+#   cache_ttl_secs = 300   # auto-approve same exact argv for N seconds after one approval
+#   rate_per_min   = 10    # max approvals/min; over limit → denied (never auto-approved)
+
+[[allow]]
+argv = ["pacman", "-S", "**"]
+
+[[allow]]
+argv = ["pacman", "-Syu", "**"]
+
+[[allow]]
+argv = ["systemctl", "status", "*"]
+
+[[allow]]
+argv = ["systemctl", "restart", "*"]
+
+[[allow]]
+argv = ["id"]
 "#
     .to_string()
 }
@@ -287,22 +327,27 @@ mod tests {
     fn round_trip_allow_deny() {
         let cfg = load_str(
             r#"
-allow = [["pacman", "-S", "**"], ["id"]]
 hard_deny = ["dd"]
 agent_uids = [1000]
 approver_uids = [1000]
+
+[[allow]]
+argv = ["pacman", "-S", "**"]
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap();
         let policy = cfg.build_policy();
-        assert_eq!(
+        assert!(matches!(
             policy.evaluate(&["pacman", "-S", "rg"].map(str::to_string)),
-            Verdict::Allowed
-        );
-        assert_eq!(
+            Verdict::Allowed { .. }
+        ));
+        assert!(matches!(
             policy.evaluate(&["id"].map(str::to_string)),
-            Verdict::Allowed
-        );
+            Verdict::Allowed { .. }
+        ));
         assert!(matches!(
             policy.evaluate(&["dd", "if=/dev/zero"].map(str::to_string)),
             Verdict::Denied { .. }
@@ -317,10 +362,12 @@ approver_uids = [1000]
     fn misplaced_double_star_is_invalid() {
         let err = load_str(
             r#"
-allow = [["pacman", "**", "-S"]]
 hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
+
+[[allow]]
+argv = ["pacman", "**", "-S"]
 "#,
         )
         .unwrap_err();
@@ -335,11 +382,13 @@ approver_uids = [1000]
     fn unknown_key_is_a_parse_error() {
         let err = load_str(
             r#"
-allow = [["id"]]
 hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
 bogus_key = true
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -361,11 +410,14 @@ bogus_key = true
         let policy = cfg.build_policy();
 
         // Allowed by old compiled policy.
-        assert_eq!(
+        assert!(matches!(
             policy.evaluate(&argv(&["pacman", "-S", "rg"])),
-            Verdict::Allowed
-        );
-        assert_eq!(policy.evaluate(&argv(&["id"])), Verdict::Allowed);
+            Verdict::Allowed { .. }
+        ));
+        assert!(matches!(
+            policy.evaluate(&argv(&["id"])),
+            Verdict::Allowed { .. }
+        ));
         // Denied by hard denylist.
         assert!(matches!(
             policy.evaluate(&argv(&["bash", "-c", "rm -rf /"])),
@@ -382,13 +434,15 @@ bogus_key = true
     fn disjoint_uids_with_zenity_is_invalid() {
         let err = load_str(
             r#"
-allow = [["id"]]
 hard_deny = []
 agent_uids = [2000]
 approver_uids = [1000]
 
 [approval]
 method = "zenity"
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -403,13 +457,15 @@ method = "zenity"
     fn overlapping_uids_with_zenity_is_valid() {
         load_str(
             r#"
-allow = [["id"]]
 hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
 
 [approval]
 method = "zenity"
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap();
@@ -419,7 +475,6 @@ method = "zenity"
     fn totp_method_parses() {
         let cfg = load_str(
             r#"
-allow = [["id"]]
 hard_deny = []
 agent_uids = [2000]
 approver_uids = [1000]
@@ -427,6 +482,9 @@ approver_uids = [1000]
 [approval]
 method = "totp"
 totp_secret_path = "/etc/sudix/totp.key"
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap();
@@ -437,13 +495,15 @@ totp_secret_path = "/etc/sudix/totp.key"
     fn totp_method_without_secret_path_is_invalid() {
         let err = load_str(
             r#"
-allow = [["id"]]
 hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
 
 [approval]
 method = "totp"
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -458,13 +518,15 @@ method = "totp"
     fn bad_method_string_is_parse_error() {
         let err = load_str(
             r#"
-allow = [["id"]]
 hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
 
 [approval]
 method = "pigeons"
+
+[[allow]]
+argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -477,7 +539,7 @@ method = "pigeons"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"allow=[]\nhard_deny=[]\nagent_uids=[1000]\napprover_uids=[1000]\n")
+        f.write_all(b"hard_deny=[]\nagent_uids=[1000]\napprover_uids=[1000]\n")
             .unwrap();
         drop(f);
         // Make it world-writable.

@@ -20,6 +20,7 @@ pub mod audit;
 pub mod config;
 pub mod policy;
 pub mod protocol;
+pub mod scoping;
 pub mod server;
 
 pub use approval::{Approver, ZenityApprover};

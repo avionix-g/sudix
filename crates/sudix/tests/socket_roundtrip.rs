@@ -11,6 +11,7 @@ use std::thread;
 use sudix::approval::Approver;
 use sudix::policy::{Policy, Rule};
 use sudix::protocol::{Request, Response};
+use sudix::scoping::RuleScope;
 use sudix::server::{Config, serve};
 
 /// Always-allow approver for the happy path.
@@ -27,6 +28,10 @@ fn spawn_broker(dir: &std::path::Path, agent_uids: Vec<u32>) -> std::path::PathB
         socket_path: socket_path.clone(),
         agent_uids,
         policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
+        rule_scopes: vec![RuleScope {
+            cache_ttl_secs: 0,
+            rate_per_min: 0,
+        }],
         audit_path: dir.join("audit.log"),
     };
     thread::spawn(move || {
