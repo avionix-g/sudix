@@ -10,6 +10,7 @@ license = "MPL-2.0"
 
 [workspace.dependencies]
 assert_cmd = "2"
+listenfd = "1"
 nix = { version = "0.31", features = ["process", "socket", "user"] }
 predicates = "3"
 serde = { version = "1", features = ["derive"] }

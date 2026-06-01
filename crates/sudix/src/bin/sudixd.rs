@@ -15,10 +15,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use listenfd::ListenFd;
+
 use sudix::approval::approver_for;
 use sudix::config::{self, FileConfig};
 use sudix::scoping::RuleScope;
-use sudix::server::{Config, serve};
+use sudix::server::{Config, serve, serve_on};
 
 fn main() -> ExitCode {
     let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -82,20 +84,37 @@ fn main() -> ExitCode {
         audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
     };
 
-    if let Some(parent) = cfg.socket_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        eprintln!("sudixd: cannot create {}: {e}", parent.display());
-        return ExitCode::FAILURE;
-    }
+    // Prefer a pre-bound listener from systemd socket activation. If none is
+    // available, bind the socket ourselves (and create the runtime dir first).
+    let result = if let Some(listener) = try_systemd_listener() {
+        eprintln!(
+            "sudixd: using systemd-passed socket (agent uids: {:?})",
+            cfg.agent_uids
+        );
+        serve_on(&listener, &cfg, approver.as_ref())
+    } else {
+        if let Some(parent) = cfg.socket_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("sudixd: cannot create {}: {e}", parent.display());
+            return ExitCode::FAILURE;
+        }
+        serve(&cfg, approver.as_ref())
+    };
 
-    match serve(&cfg, approver.as_ref()) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sudixd: fatal: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Return the first Unix listener handed in by systemd socket activation, if any.
+fn try_systemd_listener() -> Option<std::os::unix::net::UnixListener> {
+    let mut lfd = ListenFd::from_env();
+    lfd.take_unix_listener(0).ok().flatten()
 }
 
 fn cmd_enroll(force: bool) -> ExitCode {

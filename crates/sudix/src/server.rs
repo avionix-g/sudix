@@ -204,6 +204,9 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
 
 /// Serve connections on an already-bound listener.
 ///
+/// # Errors
+/// See [`serve`].
+///
 /// Splits socket binding from serving so integration tests can inject their own
 /// listener, and so systemd socket activation can hand over a pre-bound fd.
 ///

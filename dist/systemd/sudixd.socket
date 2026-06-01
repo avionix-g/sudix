@@ -1,0 +1,10 @@
+[Unit]
+Description=sudix privileged broker socket
+
+[Socket]
+ListenStream=/run/sudix/sudixd.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
