@@ -52,9 +52,9 @@ impl From<std::io::Error> for ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMethod {
-    /// Desktop dialog via `zenity` (requires a GUI session).
-    Zenity,
-    /// Headless TOTP code in the request (implemented in Step 6).
+    /// Per-user agent in the graphical session (`sudix-agent`).
+    Agent,
+    /// Headless TOTP code in the request.
     Totp,
 }
 
@@ -71,7 +71,7 @@ pub struct ApprovalConfig {
 impl Default for ApprovalConfig {
     fn default() -> Self {
         Self {
-            method: ApprovalMethod::Zenity,
+            method: ApprovalMethod::Agent,
             totp_secret_path: None,
         }
     }
@@ -159,21 +159,6 @@ impl FileConfig {
         if self.approver_uids.is_empty() {
             return Err(ConfigError::Invalid(
                 "approver_uids must not be empty".into(),
-            ));
-        }
-
-        // Disjoint UID sets with zenity is a misconfiguration: a desktop dialog
-        // cannot prove that a human (who isn't the connecting agent) is present.
-        let sets_disjoint = !self
-            .agent_uids
-            .iter()
-            .any(|uid| self.approver_uids.contains(uid));
-        if sets_disjoint && self.approval.method == ApprovalMethod::Zenity {
-            return Err(ConfigError::Invalid(
-                "agent_uids and approver_uids are disjoint but method=\"zenity\"; \
-                 a desktop dialog cannot prove human presence for a separate agent uid — \
-                 use method=\"totp\" for headless deployments"
-                    .into(),
             ));
         }
 
@@ -268,8 +253,8 @@ agent_uids    = [1000]
 approver_uids = [1000]
 
 [approval]
-# "zenity" (desktop dialog) or "totp" (headless; also set totp_secret_path).
-method = "zenity"
+# "agent" (per-user sudix-agent in the graphical session) or "totp" (headless).
+method = "agent"
 # totp_secret_path = "/etc/sudix/totp.key"   # required when method = "totp"
 
 # Allow rules. Each entry must have an `argv` token list. The first token is
@@ -431,11 +416,11 @@ argv = ["id"]
     }
 
     #[test]
-    fn disjoint_uids_with_zenity_is_invalid() {
+    fn zenity_method_no_longer_parses() {
         let err = load_str(
             r#"
 hard_deny = []
-agent_uids = [2000]
+agent_uids = [1000]
 approver_uids = [1000]
 
 [approval]
@@ -446,15 +431,11 @@ argv = ["id"]
 "#,
         )
         .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("disjoint") || msg.contains("zenity"),
-            "expected disjoint/zenity error in: {msg}"
-        );
+        assert!(matches!(err, ConfigError::Parse(_)), "got: {err}");
     }
 
     #[test]
-    fn overlapping_uids_with_zenity_is_valid() {
+    fn agent_method_parses() {
         load_str(
             r#"
 hard_deny = []
@@ -462,7 +443,7 @@ agent_uids = [1000]
 approver_uids = [1000]
 
 [approval]
-method = "zenity"
+method = "agent"
 
 [[allow]]
 argv = ["id"]

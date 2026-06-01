@@ -11,17 +11,17 @@ use std::thread;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sudix::approval::Approver;
+use sudix::approval::{Approval, Approver};
 use sudix::policy::{Policy, Rule};
-use sudix::protocol::{Request, Response};
+use sudix::protocol::{Hello, Request, Response};
 use sudix::scoping::RuleScope;
 use sudix::server::{Config, serve};
 
 /// Always-allow approver for the happy path.
 struct AlwaysAllow;
 impl Approver for AlwaysAllow {
-    fn approve(&self, _req: &Request) -> bool {
-        true
+    fn approve(&self, _caller_uid: u32, _req: &Request) -> Approval {
+        Approval::Allowed
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
@@ -36,7 +36,7 @@ struct SlowApprover {
 }
 
 impl Approver for SlowApprover {
-    fn approve(&self, _req: &Request) -> bool {
+    fn approve(&self, _caller_uid: u32, _req: &Request) -> Approval {
         let c = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
         let mut max = self.max_seen.load(Ordering::SeqCst);
         while c > max {
@@ -50,7 +50,7 @@ impl Approver for SlowApprover {
         }
         thread::sleep(std::time::Duration::from_millis(20));
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
-        true
+        Approval::Allowed
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
@@ -94,7 +94,9 @@ fn wait_for_socket(path: &std::path::Path) {
 
 fn send(socket: &std::path::Path, req: &Request) -> Response {
     let mut stream = UnixStream::connect(socket).expect("connect");
-    stream.write_all(req.to_line().unwrap().as_bytes()).unwrap();
+    stream
+        .write_all(Hello::Command(req.clone()).to_line().unwrap().as_bytes())
+        .unwrap();
     stream.flush().unwrap();
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -125,6 +127,7 @@ fn approved_command_runs_over_the_socket() {
             assert_eq!(stdout.trim(), "roundtrip");
         }
         Response::Denied { why } => panic!("unexpected denial: {why}"),
+        Response::Error { why } => panic!("unexpected error: {why}"),
     }
 }
 
@@ -151,6 +154,7 @@ fn wrong_uid_is_rejected_before_policy() {
     match send(&socket, &req(&["echo", "hi"])) {
         Response::Denied { why } => assert!(why.contains("uid")),
         Response::Approved { .. } => panic!("connection from wrong uid was approved"),
+        Response::Error { why } => panic!("unexpected error: {why}"),
     }
 }
 
@@ -238,4 +242,119 @@ fn oversized_request_is_refused_not_buffered() {
         matches!(resp, Response::Denied { ref why } if why.contains("too large")),
         "expected 'too large' denial, got: {resp:?}"
     );
+}
+
+/// Spawn a broker that uses an agent registry. Returns (`socket_path`, registry).
+fn spawn_agent_broker(
+    dir: &std::path::Path,
+    uid: u32,
+) -> (
+    std::path::PathBuf,
+    std::sync::Arc<sudix::approval::AgentRegistry>,
+) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use sudix::approval::{AgentApprover, AgentRegistry};
+    use sudix::server::serve_on_with_registry;
+
+    let socket_path = dir.join("agent_sock");
+    let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let registry2 = Arc::clone(&registry);
+    let socket2 = socket_path.clone();
+    let cfg = Config {
+        socket_path: socket_path.clone(),
+        agent_uids: vec![uid],
+        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
+        rule_scopes: vec![],
+        audit_path: dir.join("agent_audit.log"),
+    };
+    thread::spawn(move || {
+        let listener = std::os::unix::net::UnixListener::bind(&socket2).unwrap();
+        let approver = AgentApprover {
+            registry: Arc::clone(&registry2),
+            register_wait: Duration::from_millis(200),
+            approval_gate: Arc::new(std::sync::Mutex::new(())),
+        };
+        drop(serve_on_with_registry(
+            &listener, &cfg, &approver, &registry2,
+        ));
+    });
+    wait_for_socket(&socket_path);
+    (socket_path, registry)
+}
+
+/// Register a fake agent that sends the given verdict for every prompt.
+fn register_fake_agent(socket_path: &std::path::Path, verdict: sudix::protocol::Verdict) {
+    use sudix::protocol::Hello;
+    let socket_path = socket_path.to_path_buf();
+    thread::spawn(move || {
+        let stream = UnixStream::connect(&socket_path).expect("agent connect");
+        let mut write_half = stream.try_clone().unwrap();
+        write_half
+            .write_all(Hello::RegisterAgent.to_line().unwrap().as_bytes())
+            .unwrap();
+        write_half.flush().unwrap();
+        let mut reader = BufReader::new(&stream);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let v_line = verdict.to_line().unwrap();
+                    if write_half.write_all(v_line.as_bytes()).is_err() {
+                        break;
+                    }
+                    write_half.flush().ok();
+                    line.clear();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn agent_allows_command_end_to_end() {
+    use sudix::protocol::Verdict;
+    let uid = nix::unistd::getuid().as_raw();
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, _registry) = spawn_agent_broker(dir.path(), uid);
+    register_fake_agent(&socket, Verdict::Allow);
+
+    match send(&socket, &req(&["echo", "agent-allow"])) {
+        Response::Approved {
+            exit_code, stdout, ..
+        } => {
+            assert_eq!(exit_code, 0);
+            assert_eq!(stdout.trim(), "agent-allow");
+        }
+        other => panic!("expected Approved, got: {other:?}"),
+    }
+}
+
+#[test]
+fn agent_denies_command_end_to_end() {
+    use sudix::protocol::Verdict;
+    let uid = nix::unistd::getuid().as_raw();
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, _registry) = spawn_agent_broker(dir.path(), uid);
+    register_fake_agent(&socket, Verdict::Deny);
+
+    match send(&socket, &req(&["echo", "agent-deny"])) {
+        Response::Denied { .. } => {}
+        other => panic!("expected Denied, got: {other:?}"),
+    }
+}
+
+#[test]
+fn no_agent_command_returns_response_error() {
+    let uid = nix::unistd::getuid().as_raw();
+    let dir = tempfile::tempdir().unwrap();
+    // spawn_agent_broker uses a 200ms register_wait; we don't register any agent
+    let (socket, _registry) = spawn_agent_broker(dir.path(), uid);
+
+    match send(&socket, &req(&["echo", "no-agent"])) {
+        Response::Error { .. } => {}
+        other => panic!("expected Error (no agent), got: {other:?}"),
+    }
 }

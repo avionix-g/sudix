@@ -3,7 +3,11 @@ Description=sudix privileged broker socket
 
 [Socket]
 ListenStream=/run/sudix/sudixd.sock
-SocketMode=0600
+# Authorization is by SO_PEERCRED (cfg.agent_uids), not socket mode.
+# 0666 lets any user attempt a connection; non-authorized uids are refused
+# before policy is consulted. Tighten to 0660 + SocketGroup=sudix if you
+# prefer defense-in-depth at the filesystem level.
+SocketMode=0666
 DirectoryMode=0700
 
 [Install]

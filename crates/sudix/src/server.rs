@@ -1,6 +1,7 @@
 //! The broker daemon: socket loop, peer-credential auth, and the
 //! policy → approval → execute → audit pipeline.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -19,10 +20,10 @@ const MAX_REASON_BYTES: usize = 512;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
-use crate::approval::Approver;
+use crate::approval::{AgentHandle, AgentRegistry, Approval, Approver};
 use crate::audit::{self, Outcome};
 use crate::policy::{Policy, Verdict};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Hello, Request, Response};
 use crate::scoping::{self, ApprovalState, Clock, RealClock, RuleScope};
 
 /// Runtime configuration for the daemon.
@@ -152,18 +153,25 @@ pub fn handle_request(
         local_mutex = Mutex::new(());
         &local_mutex
     };
-    let human_approved = {
+    let approval = {
         let _guard = gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        approver.approve(req)
+        approver.approve(caller_uid, req)
     };
 
-    if !human_approved {
-        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedUser);
-        return Response::Denied {
-            why: "denied by user".into(),
-        };
+    match approval {
+        Approval::Denied => {
+            audit_best_effort(cfg, caller_uid, req, Outcome::DeniedUser);
+            return Response::Denied {
+                why: "denied by user".into(),
+            };
+        }
+        Approval::Error(why) => {
+            audit_best_effort(cfg, caller_uid, req, Outcome::ApproverError);
+            return Response::Error { why };
+        }
+        Approval::Allowed => {}
     }
 
     // Record the approval for cache and rate tracking.
@@ -231,30 +239,55 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
     serve_on(&listener, cfg, approver)
 }
 
-/// Serve connections on an already-bound listener.
+/// Bind the socket and serve connections forever, using the given registry.
+///
+/// Used when the caller must share the same registry with the [`AgentApprover`]
+/// it passes in. For the TOTP/static path, use [`serve`] instead.
 ///
 /// # Errors
-/// See [`serve`].
-///
-/// Splits socket binding from serving so integration tests can inject their own
-/// listener, and so systemd socket activation can hand over a pre-bound fd.
-///
-/// Each connection gets its own thread. The human-facing approval step is
-/// serialized via a dedicated mutex so at most one dialog is outstanding at a
-/// time. Cache/rate state updates take a separate short-lived lock.
-///
-/// Lock ordering (never hold both simultaneously):
-///   `approval_mutex` first, then `state_mutex` in a separate lock scope.
+/// Returns an error only if the socket cannot be bound.
+pub fn serve_with_registry(
+    cfg: &Config,
+    approver: &dyn Approver,
+    registry: &Arc<AgentRegistry>,
+) -> io::Result<()> {
+    let _stale = std::fs::remove_file(&cfg.socket_path);
+    let listener = UnixListener::bind(&cfg.socket_path)?;
+    restrict_socket_permissions(&cfg.socket_path)?;
+    eprintln!(
+        "sudixd: listening on {} (agent uids: {:?})",
+        cfg.socket_path.display(),
+        cfg.agent_uids
+    );
+    serve_on_with_registry(&listener, cfg, approver, registry)
+}
+
+/// Serve connections on an already-bound listener, using the given registry.
 ///
 /// # Errors
-/// Returns an error only if `listener.incoming()` itself fails unrecoverably
-/// (in practice this means the listener was already closed).
-pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
+/// See [`serve_on`].
+pub fn serve_on_with_registry(
+    listener: &UnixListener,
+    cfg: &Config,
+    base_approver: &dyn Approver,
+    registry: &Arc<AgentRegistry>,
+) -> io::Result<()> {
+    // For the agent path, approval serialization is managed by AgentApprover's
+    // own gate — no outer mutex is needed here.
+    serve_on_with_registry_inner(listener, cfg, base_approver, registry, None);
+    Ok(())
+}
+
+fn serve_on_with_registry_inner(
+    listener: &UnixListener,
+    cfg: &Config,
+    base_approver: &dyn Approver,
+    registry: &Arc<AgentRegistry>,
+    outer_approval_gate: Option<&Arc<Mutex<()>>>,
+) {
     let cfg = Arc::new(cfg.clone());
-    let approver: Arc<dyn Approver> = Arc::from(approver.clone_box());
+    let base_approver: Arc<dyn Approver> = Arc::from(base_approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
-    // Serializes the blocking human-approval step so only one dialog shows at a time.
-    let approval_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     // Counting semaphore: limits concurrent threads to MAX_CONCURRENT.
     let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0usize), Condvar::new()));
 
@@ -280,16 +313,22 @@ pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) 
         }
 
         let cfg2 = Arc::clone(&cfg);
-        let approver2 = Arc::clone(&approver);
+        let base_approver2 = Arc::clone(&base_approver);
         let state2 = Arc::clone(&state);
-        let amtx2 = Arc::clone(&approval_mutex);
         let sem2 = Arc::clone(&sem);
+        let registry2 = Arc::clone(registry);
+        let gate2 = outer_approval_gate.map(Arc::clone);
 
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Err(e) =
-                    handle_connection_threaded(&cfg2, &*approver2, &state2, &amtx2, &stream)
-                {
+                if let Err(e) = handle_connection_threaded(
+                    &cfg2,
+                    &*base_approver2,
+                    &state2,
+                    gate2.as_deref(),
+                    &registry2,
+                    &stream,
+                ) {
                     eprintln!("sudixd: connection error: {e}");
                 }
             }));
@@ -305,22 +344,54 @@ pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) 
             cvar.notify_one();
         });
     }
+}
+
+/// Serve connections on an already-bound listener.
+///
+/// # Errors
+/// See [`serve`].
+///
+/// Splits socket binding from serving so integration tests can inject their own
+/// listener, and so systemd socket activation can hand over a pre-bound fd.
+///
+/// Each connection gets its own thread. The human-facing approval step is
+/// serialized via a dedicated mutex so at most one dialog is outstanding at a
+/// time. Cache/rate state updates take a separate short-lived lock.
+///
+/// Lock ordering (never hold both simultaneously):
+///   `approval_mutex` first, then `state_mutex` in a separate lock scope.
+///
+/// # Errors
+/// Returns an error only if `listener.incoming()` itself fails unrecoverably
+/// (in practice this means the listener was already closed).
+pub fn serve_on(
+    listener: &UnixListener,
+    cfg: &Config,
+    base_approver: &dyn Approver,
+) -> io::Result<()> {
+    let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    // Serializes the blocking human-approval step so at most one dialog is
+    // outstanding at a time. AgentApprover manages its own gate internally.
+    let gate = Arc::new(Mutex::new(()));
+    serve_on_with_registry_inner(listener, cfg, base_approver, &registry, Some(&gate));
     Ok(())
 }
 
-/// Lock the socket to owner-only access (0600). Defense in depth: the peer-cred
-/// check is the real gate, but there is no reason for the socket to be group-
-/// or world-reachable.
+/// Set the socket mode to 0666. Authorization is by peer-cred (`SO_PEERCRED`),
+/// not by filesystem permission — the mode only controls who may *attempt* a
+/// connection, and non-root callers (including sudix-agent) need to reach it.
+/// 0666 here matches the systemd SocketMode=0666 so both code paths agree.
 fn restrict_socket_permissions(path: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
 }
 
 fn handle_connection_threaded(
     cfg: &Config,
-    approver: &dyn Approver,
+    base_approver: &dyn Approver,
     state: &Mutex<ApprovalState>,
-    approval_mutex: &Mutex<()>,
+    approval_mutex: Option<&Mutex<()>>,
+    registry: &Arc<AgentRegistry>,
     stream: &UnixStream,
 ) -> io::Result<()> {
     let caller_uid = peer_uid(stream)?;
@@ -346,21 +417,50 @@ fn handle_connection_threaded(
     }
 
     let clock = RealClock;
-    let resp = match Request::from_line(&line) {
-        Ok(req) => handle_request(
-            cfg,
-            caller_uid,
-            approver,
-            state,
-            Some(approval_mutex),
-            &clock,
-            &req,
-        ),
-        Err(e) => Response::Denied {
-            why: format!("malformed request: {e}"),
-        },
-    };
-    write_response(stream, &resp)
+    match Hello::from_line(&line) {
+        Ok(Hello::Command(req)) => {
+            let resp = handle_request(
+                cfg,
+                caller_uid,
+                base_approver,
+                state,
+                approval_mutex,
+                &clock,
+                &req,
+            );
+            write_response(stream, &resp)
+        }
+        Ok(Hello::RegisterAgent) => {
+            // Insert this connection as the live agent for caller_uid.
+            let handle = Arc::new(AgentHandle::new(stream.try_clone()?));
+            {
+                let (ref lock, ref cv) = **registry;
+                let mut reg = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                reg.insert(caller_uid, Arc::clone(&handle));
+                cv.notify_all();
+            }
+
+            // Block until the agent disconnects; AgentHandle::prompt signals
+            // disconnection when it gets EOF or an I/O error.
+            handle.wait_until_disconnected();
+
+            // Remove from registry on disconnect.
+            let (ref lock, _) = **registry;
+            let mut reg = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.remove(&caller_uid);
+            Ok(())
+        }
+        Err(e) => {
+            let resp = Response::Denied {
+                why: format!("malformed request: {e}"),
+            };
+            write_response(stream, &resp)
+        }
+    }
 }
 
 /// Authenticate the connecting process by kernel-vouched credentials. The uid
@@ -405,18 +505,26 @@ mod tests {
     /// Approver that always answers a fixed verdict and counts calls, so we can
     /// assert it was (or was not) consulted.
     struct FakeApprover {
-        answer: bool,
+        answer: Approval,
         calls: Arc<AtomicU32>,
     }
     impl Approver for FakeApprover {
-        fn approve(&self, _req: &Request) -> bool {
+        fn approve(&self, _caller_uid: u32, _req: &Request) -> Approval {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            self.answer
+            match &self.answer {
+                Approval::Allowed => Approval::Allowed,
+                Approval::Denied => Approval::Denied,
+                Approval::Error(e) => Approval::Error(e.clone()),
+            }
         }
 
         fn clone_box(&self) -> Box<dyn Approver> {
             Box::new(Self {
-                answer: self.answer,
+                answer: match &self.answer {
+                    Approval::Allowed => Approval::Allowed,
+                    Approval::Denied => Approval::Denied,
+                    Approval::Error(e) => Approval::Error(e.clone()),
+                },
                 calls: Arc::clone(&self.calls),
             })
         }
@@ -445,7 +553,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -474,7 +582,7 @@ mod tests {
         let file_path = dir.path().join("notadir");
         std::fs::write(&file_path, b"x").unwrap();
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -500,7 +608,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -523,7 +631,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: false,
+            answer: Approval::Denied,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -541,11 +649,35 @@ mod tests {
     }
 
     #[test]
+    fn approver_error_yields_response_error_and_audits_approver_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let approver = FakeApprover {
+            answer: Approval::Error("no agent running".into()),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            None,
+            &RealClock,
+            &req(&["echo", "hi"]),
+        );
+        assert!(matches!(resp, Response::Error { .. }));
+        assert_eq!(approver.calls.load(Ordering::Relaxed), 1);
+        let body = std::fs::read_to_string(&cfg.audit_path).unwrap();
+        assert!(body.contains("approver-error"));
+    }
+
+    #[test]
     fn approved_command_executes_and_returns_output() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -566,6 +698,7 @@ mod tests {
                 assert_eq!(stdout.trim(), "hello");
             }
             Response::Denied { why } => panic!("expected approval, got denial: {why}"),
+            Response::Error { why } => panic!("expected approval, got error: {why}"),
         }
     }
 
@@ -574,7 +707,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let yes = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -600,5 +733,36 @@ mod tests {
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("executed"));
         assert!(body.contains("denied-policy"));
+    }
+
+    #[test]
+    fn agent_approver_no_agent_yields_response_error() {
+        use crate::approval::{AgentApprover, AgentRegistry};
+        use std::collections::HashMap;
+        use std::sync::Condvar;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let approver = AgentApprover {
+            registry,
+            register_wait: Duration::from_millis(50),
+            approval_gate: Arc::new(Mutex::new(())),
+        };
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            None,
+            &RealClock,
+            &req(&["echo", "hi"]),
+        );
+        assert!(
+            matches!(resp, Response::Error { .. }),
+            "expected Error, got {resp:?}"
+        );
     }
 }
