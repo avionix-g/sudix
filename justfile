@@ -22,3 +22,6 @@ machete:
 
 test:
     cargo test
+
+build-release:
+    cargo build --all-targets --release
