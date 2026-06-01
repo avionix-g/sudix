@@ -1,4 +1,4 @@
-set unstable := true
+set unstable
 
 prep: format lint machete build test
 

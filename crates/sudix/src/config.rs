@@ -48,6 +48,35 @@ impl From<std::io::Error> for ConfigError {
 // TOML schema
 // ---------------------------------------------------------------------------
 
+/// Approval method selector.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMethod {
+    /// Desktop dialog via `zenity` (requires a GUI session).
+    Zenity,
+    /// Headless TOTP code in the request (implemented in Step 6).
+    Totp,
+}
+
+/// `[approval]` table in the config file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// Which approver to use.
+    pub method: ApprovalMethod,
+    /// Required when `method = "totp"`: path to the root-owned secret file.
+    pub totp_secret_path: Option<String>,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            method: ApprovalMethod::Zenity,
+            totp_secret_path: None,
+        }
+    }
+}
+
 /// On-disk config file schema.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +85,13 @@ pub struct FileConfig {
     pub allow: Vec<Vec<String>>,
     /// Hard-denied program basenames.
     pub hard_deny: Vec<String>,
+    /// UIDs permitted to submit requests (agent service accounts).
+    pub agent_uids: Vec<u32>,
+    /// UIDs whose live presence the approval step is meant to prove.
+    pub approver_uids: Vec<u32>,
+    /// Approval method configuration.
+    #[serde(default)]
+    pub approval: ApprovalConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +133,38 @@ impl FileConfig {
             Rule::new(toks.iter().map(String::as_str))
                 .map_err(|e| ConfigError::Invalid(format!("allow rule {i}: {e}")))?;
         }
+
+        if self.agent_uids.is_empty() {
+            return Err(ConfigError::Invalid("agent_uids must not be empty".into()));
+        }
+        if self.approver_uids.is_empty() {
+            return Err(ConfigError::Invalid(
+                "approver_uids must not be empty".into(),
+            ));
+        }
+
+        // Disjoint UID sets with zenity is a misconfiguration: a desktop dialog
+        // cannot prove that a human (who isn't the connecting agent) is present.
+        let sets_disjoint = !self
+            .agent_uids
+            .iter()
+            .any(|uid| self.approver_uids.contains(uid));
+        if sets_disjoint && self.approval.method == ApprovalMethod::Zenity {
+            return Err(ConfigError::Invalid(
+                "agent_uids and approver_uids are disjoint but method=\"zenity\"; \
+                 a desktop dialog cannot prove human presence for a separate agent uid — \
+                 use method=\"totp\" for headless deployments"
+                    .into(),
+            ));
+        }
+
+        if self.approval.method == ApprovalMethod::Totp && self.approval.totp_secret_path.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "method=\"totp\" requires approval.totp_secret_path".into(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -176,6 +244,16 @@ hard_deny = [
   "vi", "vim", "nano",
   "python", "perl",
 ]
+
+# Replace 1000 with the uid(s) of the agent and the human approver.
+# For a single-user desktop deployment both lists contain the same uid.
+agent_uids    = [1000]
+approver_uids = [1000]
+
+[approval]
+# "zenity" (desktop dialog) or "totp" (headless; also set totp_secret_path).
+method = "zenity"
+# totp_secret_path = "/etc/sudix/totp.key"   # required when method = "totp"
 "#
     .to_string()
 }
@@ -211,6 +289,8 @@ mod tests {
             r#"
 allow = [["pacman", "-S", "**"], ["id"]]
 hard_deny = ["dd"]
+agent_uids = [1000]
+approver_uids = [1000]
 "#,
         )
         .unwrap();
@@ -239,6 +319,8 @@ hard_deny = ["dd"]
             r#"
 allow = [["pacman", "**", "-S"]]
 hard_deny = []
+agent_uids = [1000]
+approver_uids = [1000]
 "#,
         )
         .unwrap_err();
@@ -255,6 +337,8 @@ hard_deny = []
             r#"
 allow = [["id"]]
 hard_deny = []
+agent_uids = [1000]
+approver_uids = [1000]
 bogus_key = true
 "#,
         )
@@ -295,12 +379,106 @@ bogus_key = true
     }
 
     #[test]
+    fn disjoint_uids_with_zenity_is_invalid() {
+        let err = load_str(
+            r#"
+allow = [["id"]]
+hard_deny = []
+agent_uids = [2000]
+approver_uids = [1000]
+
+[approval]
+method = "zenity"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("disjoint") || msg.contains("zenity"),
+            "expected disjoint/zenity error in: {msg}"
+        );
+    }
+
+    #[test]
+    fn overlapping_uids_with_zenity_is_valid() {
+        load_str(
+            r#"
+allow = [["id"]]
+hard_deny = []
+agent_uids = [1000]
+approver_uids = [1000]
+
+[approval]
+method = "zenity"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn totp_method_parses() {
+        let cfg = load_str(
+            r#"
+allow = [["id"]]
+hard_deny = []
+agent_uids = [2000]
+approver_uids = [1000]
+
+[approval]
+method = "totp"
+totp_secret_path = "/etc/sudix/totp.key"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.approval.method, ApprovalMethod::Totp);
+    }
+
+    #[test]
+    fn totp_method_without_secret_path_is_invalid() {
+        let err = load_str(
+            r#"
+allow = [["id"]]
+hard_deny = []
+agent_uids = [1000]
+approver_uids = [1000]
+
+[approval]
+method = "totp"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("totp_secret_path"),
+            "expected totp_secret_path error in: {msg}"
+        );
+    }
+
+    #[test]
+    fn bad_method_string_is_parse_error() {
+        let err = load_str(
+            r#"
+allow = [["id"]]
+hard_deny = []
+agent_uids = [1000]
+approver_uids = [1000]
+
+[approval]
+method = "pigeons"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got: {err}");
+    }
+
+    #[test]
     fn perm_check_rejects_world_writable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"allow=[]\nhard_deny=[]\n").unwrap();
+        f.write_all(b"allow=[]\nhard_deny=[]\nagent_uids=[1000]\napprover_uids=[1000]\n")
+            .unwrap();
         drop(f);
         // Make it world-writable.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();

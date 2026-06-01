@@ -45,18 +45,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let allowed_uid = match allowed_uid() {
-        Ok(uid) => uid,
-        Err(e) => {
-            eprintln!("sudixd: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     let runtime_dir = std::env::var("SUDIX_RUNTIME_DIR").unwrap_or_else(|_| "/run/sudix".into());
     let cfg = Config {
         socket_path: PathBuf::from(&runtime_dir).join("sudixd.sock"),
-        allowed_uid,
+        agent_uids: file_cfg.agent_uids.clone(),
         policy: file_cfg.build_policy(),
         audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
     };
@@ -75,11 +67,4 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn allowed_uid() -> Result<u32, String> {
-    let raw = std::env::var("SUDIX_ALLOWED_UID")
-        .map_err(|_| "set SUDIX_ALLOWED_UID to the uid permitted to call the broker".to_string())?;
-    raw.parse::<u32>()
-        .map_err(|e| format!("SUDIX_ALLOWED_UID is not a valid uid: {e}"))
 }

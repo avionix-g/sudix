@@ -17,9 +17,9 @@ use crate::protocol::{Request, Response};
 pub struct Config {
     /// Where the listening unix socket lives.
     pub socket_path: PathBuf,
-    /// The single uid permitted to talk to the broker. A connection from any
-    /// other uid is refused before policy is even consulted.
-    pub allowed_uid: u32,
+    /// UIDs permitted to submit requests. A connection from any other uid is
+    /// refused before policy is even consulted.
+    pub agent_uids: Vec<u32>,
     /// The authorization policy.
     pub policy: Policy,
     /// Append-only audit log path.
@@ -116,9 +116,9 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
     restrict_socket_permissions(&cfg.socket_path)?;
 
     eprintln!(
-        "sudixd: listening on {} (uid {} only)",
+        "sudixd: listening on {} (agent uids: {:?})",
         cfg.socket_path.display(),
-        cfg.allowed_uid
+        cfg.agent_uids
     );
 
     for conn in listener.incoming() {
@@ -144,7 +144,7 @@ fn restrict_socket_permissions(path: &std::path::Path) -> io::Result<()> {
 
 fn handle_connection(cfg: &Config, approver: &dyn Approver, stream: &UnixStream) -> io::Result<()> {
     let caller_uid = peer_uid(stream)?;
-    if caller_uid != cfg.allowed_uid {
+    if !cfg.agent_uids.contains(&caller_uid) {
         // Refuse before reading anything from an unauthorized peer.
         let resp = Response::Denied {
             why: "caller uid not authorized".into(),
@@ -193,7 +193,7 @@ mod tests {
     fn test_cfg(dir: &std::path::Path) -> Config {
         Config {
             socket_path: dir.join("sock"),
-            allowed_uid: 1000,
+            agent_uids: vec![1000],
             policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
             audit_path: dir.join("audit.log"),
         }

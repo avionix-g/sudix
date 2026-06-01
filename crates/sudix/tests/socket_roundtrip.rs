@@ -21,11 +21,11 @@ impl Approver for AlwaysAllow {
     }
 }
 
-fn spawn_broker(dir: &std::path::Path, allowed_uid: u32) -> std::path::PathBuf {
+fn spawn_broker(dir: &std::path::Path, agent_uids: Vec<u32>) -> std::path::PathBuf {
     let socket_path = dir.join("sock");
     let cfg = Config {
         socket_path: socket_path.clone(),
-        allowed_uid,
+        agent_uids,
         policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
         audit_path: dir.join("audit.log"),
     };
@@ -70,7 +70,7 @@ fn req(parts: &[&str]) -> Request {
 fn approved_command_runs_over_the_socket() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket = spawn_broker(dir.path(), uid);
+    let socket = spawn_broker(dir.path(), vec![uid]);
 
     match send(&socket, &req(&["echo", "roundtrip"])) {
         Response::Approved {
@@ -87,7 +87,7 @@ fn approved_command_runs_over_the_socket() {
 fn policy_denied_command_is_refused_over_the_socket() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket = spawn_broker(dir.path(), uid);
+    let socket = spawn_broker(dir.path(), vec![uid]);
 
     assert!(matches!(
         send(&socket, &req(&["rm", "-rf", "/"])),
@@ -101,7 +101,7 @@ fn wrong_uid_is_rejected_before_policy() {
     // on peer-cred grounds alone, without consulting policy.
     let our_uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket = spawn_broker(dir.path(), our_uid.wrapping_add(1));
+    let socket = spawn_broker(dir.path(), vec![our_uid.wrapping_add(1)]);
 
     match send(&socket, &req(&["echo", "hi"])) {
         Response::Denied { why } => assert!(why.contains("uid")),
