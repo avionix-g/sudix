@@ -5,7 +5,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+
+/// Maximum concurrent connections. Over this, new connections block until a
+/// slot is free. Guards against resource exhaustion at the daemon's expected
+/// low-volume use.
+const MAX_CONCURRENT: usize = 16;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
@@ -28,6 +33,19 @@ pub struct Config {
     pub rule_scopes: Vec<RuleScope>,
     /// Append-only audit log path.
     pub audit_path: PathBuf,
+}
+
+impl Config {
+    /// Produce a thread-shareable clone. `Config` is plain data.
+    fn clone_for_thread(&self) -> Self {
+        Self {
+            socket_path: self.socket_path.clone(),
+            agent_uids: self.agent_uids.clone(),
+            policy: self.policy.clone(),
+            rule_scopes: self.rule_scopes.clone(),
+            audit_path: self.audit_path.clone(),
+        }
+    }
 }
 
 /// Decide and (if approved) execute a request. This is the heart of the broker,
@@ -168,36 +186,92 @@ fn audit_best_effort(cfg: &Config, caller_uid: u32, req: &Request, outcome: &str
     }
 }
 
-/// Bind the socket and serve connections forever. Each connection is one
-/// request/response. Errors on a single connection are logged and skipped; they
-/// never bring down the daemon.
+/// Bind the socket and serve connections forever.
 ///
 /// # Errors
 /// Returns an error only if the socket cannot be bound.
 pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
-    // Remove a stale socket from a previous run, then bind fresh.
     let _stale = std::fs::remove_file(&cfg.socket_path);
     let listener = UnixListener::bind(&cfg.socket_path)?;
     restrict_socket_permissions(&cfg.socket_path)?;
-
     eprintln!(
         "sudixd: listening on {} (agent uids: {:?})",
         cfg.socket_path.display(),
         cfg.agent_uids
     );
+    serve_on(&listener, cfg, approver)
+}
 
+/// Serve connections on an already-bound listener.
+///
+/// Splits socket binding from serving so integration tests can inject their own
+/// listener, and so systemd socket activation can hand over a pre-bound fd.
+///
+/// Each connection gets its own thread. The human-facing approval step is
+/// serialized via a dedicated mutex so at most one dialog is outstanding at a
+/// time. Cache/rate state updates take a separate short-lived lock.
+///
+/// Lock ordering (never hold both simultaneously):
+///   `approval_mutex` first, then `state_mutex` in a separate lock scope.
+///
+/// # Errors
+/// Returns an error only if `listener.incoming()` itself fails unrecoverably
+/// (in practice this means the listener was already closed).
+pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
+    let cfg = Arc::new(cfg.clone_for_thread());
+    let approver: Arc<dyn Approver> = Arc::from(approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
-    let clock = RealClock;
+    // Serializes the blocking human-approval step so only one dialog shows at a time.
+    let approval_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    // Counting semaphore: limits concurrent threads to MAX_CONCURRENT.
+    let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0usize), Condvar::new()));
 
     for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                if let Err(e) = handle_connection(cfg, approver, &state, &clock, &stream) {
+        let stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sudixd: accept error: {e}");
+                continue;
+            }
+        };
+
+        // Wait for a slot.
+        {
+            let (lock, cvar) = sem.as_ref();
+            let mut count = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            count = cvar
+                .wait_while(count, |c| *c >= MAX_CONCURRENT)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *count += 1;
+        }
+
+        let cfg2 = Arc::clone(&cfg);
+        let approver2 = Arc::clone(&approver);
+        let state2 = Arc::clone(&state);
+        let amtx2 = Arc::clone(&approval_mutex);
+        let sem2 = Arc::clone(&sem);
+
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Err(e) =
+                    handle_connection_threaded(&cfg2, &*approver2, &state2, &amtx2, &stream)
+                {
                     eprintln!("sudixd: connection error: {e}");
                 }
+            }));
+            if result.is_err() {
+                eprintln!("sudixd: worker thread panicked; connection dropped");
             }
-            Err(e) => eprintln!("sudixd: accept error: {e}"),
-        }
+            // Release slot.
+            let (lock, cvar) = sem2.as_ref();
+            let mut count = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *count -= 1;
+            cvar.notify_one();
+        });
     }
     Ok(())
 }
@@ -210,16 +284,15 @@ fn restrict_socket_permissions(path: &std::path::Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-fn handle_connection(
+fn handle_connection_threaded(
     cfg: &Config,
     approver: &dyn Approver,
     state: &Mutex<ApprovalState>,
-    clock: &dyn Clock,
+    approval_mutex: &Mutex<()>,
     stream: &UnixStream,
 ) -> io::Result<()> {
     let caller_uid = peer_uid(stream)?;
     if !cfg.agent_uids.contains(&caller_uid) {
-        // Refuse before reading anything from an unauthorized peer.
         let resp = Response::Denied {
             why: "caller uid not authorized".into(),
         };
@@ -229,16 +302,130 @@ fn handle_connection(
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
-        return Ok(()); // peer closed without sending a request
+        return Ok(());
     }
 
+    let clock = RealClock;
     let resp = match Request::from_line(&line) {
-        Ok(req) => handle_request(cfg, caller_uid, approver, state, clock, &req),
+        Ok(req) => handle_request_with_approval_lock(
+            cfg,
+            caller_uid,
+            approver,
+            state,
+            approval_mutex,
+            &clock,
+            &req,
+        ),
         Err(e) => Response::Denied {
             why: format!("malformed request: {e}"),
         },
     };
     write_response(stream, &resp)
+}
+
+/// Like `handle_request` but holds the approval mutex across the blocking
+/// approver call, serializing human dialogs without holding it over I/O or
+/// short cache/rate checks.
+fn handle_request_with_approval_lock(
+    cfg: &Config,
+    caller_uid: u32,
+    approver: &dyn Approver,
+    state: &Mutex<ApprovalState>,
+    approval_mutex: &Mutex<()>,
+    clock: &dyn Clock,
+    req: &Request,
+) -> Response {
+    if req.argv.is_empty() {
+        audit_best_effort(cfg, caller_uid, req, "denied-empty");
+        return Response::Denied {
+            why: "empty argv".into(),
+        };
+    }
+
+    let rule_index = match cfg.policy.evaluate(&req.argv) {
+        Verdict::Denied { reason } => {
+            audit_best_effort(cfg, caller_uid, req, "denied-policy");
+            return Response::Denied { why: reason };
+        }
+        Verdict::Allowed { rule_index } => rule_index,
+    };
+
+    let Ok(cwd) = std::fs::canonicalize(&req.cwd) else {
+        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
+        return Response::Denied {
+            why: "invalid working directory".into(),
+        };
+    };
+    if !cwd.is_dir() {
+        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
+        return Response::Denied {
+            why: "invalid working directory".into(),
+        };
+    }
+
+    if scoping::is_rate_limited(state, &cfg.rule_scopes, rule_index, clock) {
+        audit_best_effort(cfg, caller_uid, req, "denied-rate");
+        return Response::Denied {
+            why: "rate limit exceeded".into(),
+        };
+    }
+
+    match scoping::check_cache(state, &cfg.rule_scopes, rule_index, &req.argv, clock) {
+        scoping::CacheVerdict::Hit => match execute(req, &cwd) {
+            Ok((exit_code, stdout, stderr)) => {
+                audit_best_effort(cfg, caller_uid, req, "approved-cached");
+                return Response::Approved {
+                    exit_code,
+                    stdout,
+                    stderr,
+                };
+            }
+            Err(e) => {
+                audit_best_effort(cfg, caller_uid, req, "execute-error");
+                return Response::Denied {
+                    why: format!("execution failed: {e}"),
+                };
+            }
+        },
+        scoping::CacheVerdict::Miss => {}
+    }
+
+    // Serialize the human-facing approval step. Cache misses reach here.
+    // The lock is held only across the blocking approver call; never across I/O
+    // or state-mutex operations (lock-ordering: approval_mutex, then state_mutex
+    // separately — never hold both at once).
+    let human_approved = {
+        let _guard = approval_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        approver.approve(req)
+    };
+
+    if !human_approved {
+        audit_best_effort(cfg, caller_uid, req, "denied-user");
+        return Response::Denied {
+            why: "denied by user".into(),
+        };
+    }
+
+    scoping::record_approval(state, &cfg.rule_scopes, rule_index, &req.argv, clock);
+
+    match execute(req, &cwd) {
+        Ok((exit_code, stdout, stderr)) => {
+            audit_best_effort(cfg, caller_uid, req, "executed");
+            Response::Approved {
+                exit_code,
+                stdout,
+                stderr,
+            }
+        }
+        Err(e) => {
+            audit_best_effort(cfg, caller_uid, req, "execute-error");
+            Response::Denied {
+                why: format!("execution failed: {e}"),
+            }
+        }
+    }
 }
 
 /// Authenticate the connecting process by kernel-vouched credentials. The uid
@@ -262,9 +449,9 @@ fn write_response(mut stream: &UnixStream, resp: &Response) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::policy::Rule;
-    use std::cell::Cell;
 
     use crate::scoping::{ApprovalState, RealClock};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn test_cfg(dir: &std::path::Path) -> Config {
         Config {
@@ -284,12 +471,19 @@ mod tests {
     /// assert it was (or was not) consulted.
     struct FakeApprover {
         answer: bool,
-        calls: Cell<u32>,
+        calls: Arc<AtomicU32>,
     }
     impl Approver for FakeApprover {
         fn approve(&self, _req: &Request) -> bool {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             self.answer
+        }
+
+        fn clone_box(&self) -> Box<dyn Approver> {
+            Box::new(Self {
+                answer: self.answer,
+                calls: Arc::clone(&self.calls),
+            })
         }
     }
 
@@ -317,7 +511,7 @@ mod tests {
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
             answer: true,
-            calls: Cell::new(0),
+            calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
         let resp = handle_request(
@@ -329,7 +523,11 @@ mod tests {
             &req_with_cwd(&["echo", "hi"], "/no/such/directory/ever"),
         );
         assert!(matches!(resp, Response::Denied { .. }));
-        assert_eq!(approver.calls.get(), 0, "approver must not be consulted");
+        assert_eq!(
+            approver.calls.load(Ordering::Relaxed),
+            0,
+            "approver must not be consulted"
+        );
     }
 
     #[test]
@@ -341,7 +539,7 @@ mod tests {
         std::fs::write(&file_path, b"x").unwrap();
         let approver = FakeApprover {
             answer: true,
-            calls: Cell::new(0),
+            calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
         let resp = handle_request(
@@ -353,7 +551,11 @@ mod tests {
             &req_with_cwd(&["echo", "hi"], file_path.to_str().unwrap()),
         );
         assert!(matches!(resp, Response::Denied { .. }));
-        assert_eq!(approver.calls.get(), 0, "approver must not be consulted");
+        assert_eq!(
+            approver.calls.load(Ordering::Relaxed),
+            0,
+            "approver must not be consulted"
+        );
     }
 
     #[test]
@@ -362,7 +564,7 @@ mod tests {
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
             answer: true,
-            calls: Cell::new(0),
+            calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
         let resp = handle_request(
@@ -375,7 +577,7 @@ mod tests {
         );
         assert!(matches!(resp, Response::Denied { .. }));
         // The human must never be bothered for a command policy already refused.
-        assert_eq!(approver.calls.get(), 0);
+        assert_eq!(approver.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -384,7 +586,7 @@ mod tests {
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
             answer: false,
-            calls: Cell::new(0),
+            calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
         let resp = handle_request(
@@ -396,7 +598,7 @@ mod tests {
             &req(&["echo", "hi"]),
         );
         assert!(matches!(resp, Response::Denied { .. }));
-        assert_eq!(approver.calls.get(), 1);
+        assert_eq!(approver.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -405,7 +607,7 @@ mod tests {
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
             answer: true,
-            calls: Cell::new(0),
+            calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
         let resp = handle_request(
@@ -433,7 +635,7 @@ mod tests {
         let cfg = test_cfg(dir.path());
         let yes = FakeApprover {
             answer: true,
-            calls: Cell::new(0),
+            calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
         handle_request(&cfg, 1000, &yes, &state, &RealClock, &req(&["echo", "ok"]));

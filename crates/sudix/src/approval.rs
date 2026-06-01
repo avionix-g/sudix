@@ -18,9 +18,11 @@ use crate::protocol::Request;
 
 /// Something that can ask a human to approve a specific, already-policy-checked
 /// request. Implementations MUST fail closed.
-pub trait Approver {
+pub trait Approver: Send + Sync {
     /// Show the exact command and return `true` only on an explicit "Allow".
     fn approve(&self, req: &Request) -> bool;
+    /// Clone into a heap-allocated trait object (for `Arc::from`).
+    fn clone_box(&self) -> Box<dyn Approver>;
 }
 
 /// Renders the message a human sees. Kept separate from the dialog mechanism so
@@ -75,6 +77,10 @@ impl Approver for ZenityApprover {
             .status()
             .is_ok_and(|s| s.success())
     }
+
+    fn clone_box(&self) -> Box<dyn Approver> {
+        Box::new(Self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +127,12 @@ impl Approver for TotpApprover {
             return false; // No code provided → fail closed.
         };
         self.totp.check_current(code).unwrap_or(false)
+    }
+
+    fn clone_box(&self) -> Box<dyn Approver> {
+        Box::new(Self {
+            totp: self.totp.clone(),
+        })
     }
 }
 

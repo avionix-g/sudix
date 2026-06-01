@@ -8,6 +8,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::thread;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use sudix::approval::Approver;
 use sudix::policy::{Policy, Rule};
 use sudix::protocol::{Request, Response};
@@ -19,6 +22,42 @@ struct AlwaysAllow;
 impl Approver for AlwaysAllow {
     fn approve(&self, _req: &Request) -> bool {
         true
+    }
+
+    fn clone_box(&self) -> Box<dyn Approver> {
+        Box::new(Self)
+    }
+}
+
+/// Approver that counts concurrent calls (to verify serialization) and sleeps.
+struct SlowApprover {
+    concurrent: Arc<AtomicU32>,
+    max_seen: Arc<AtomicU32>,
+}
+
+impl Approver for SlowApprover {
+    fn approve(&self, _req: &Request) -> bool {
+        let c = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut max = self.max_seen.load(Ordering::SeqCst);
+        while c > max {
+            match self
+                .max_seen
+                .compare_exchange(max, c, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(actual) => max = actual,
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+        self.concurrent.fetch_sub(1, Ordering::SeqCst);
+        true
+    }
+
+    fn clone_box(&self) -> Box<dyn Approver> {
+        Box::new(Self {
+            concurrent: Arc::clone(&self.concurrent),
+            max_seen: Arc::clone(&self.max_seen),
+        })
     }
 }
 
@@ -113,4 +152,53 @@ fn wrong_uid_is_rejected_before_policy() {
         Response::Denied { why } => assert!(why.contains("uid")),
         Response::Approved { .. } => panic!("connection from wrong uid was approved"),
     }
+}
+
+#[test]
+fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
+    const N: usize = 4;
+    let uid = nix::unistd::getuid().as_raw();
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("sock");
+    let concurrent = Arc::new(AtomicU32::new(0));
+    let max_seen = Arc::new(AtomicU32::new(0));
+    let approver = SlowApprover {
+        concurrent: Arc::clone(&concurrent),
+        max_seen: Arc::clone(&max_seen),
+    };
+
+    let cfg = Config {
+        socket_path: socket_path.clone(),
+        agent_uids: vec![uid],
+        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
+        rule_scopes: vec![RuleScope {
+            cache_ttl_secs: 0,
+            rate_per_min: 0,
+        }],
+        audit_path: dir.path().join("audit.log"),
+    };
+    thread::spawn(move || {
+        drop(serve(&cfg, &approver));
+    });
+    wait_for_socket(&socket_path);
+
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let sock = socket_path.clone();
+            thread::spawn(move || send(&sock, &req(&["echo", "concurrent"])))
+        })
+        .collect();
+    let responses: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All connections should complete successfully.
+    for resp in &responses {
+        assert!(matches!(resp, Response::Approved { .. }), "got: {resp:?}");
+    }
+
+    // Approval is serialized: at most one dialog outstanding at a time.
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "approval was not serialized"
+    );
 }
