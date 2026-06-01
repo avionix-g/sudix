@@ -19,7 +19,7 @@ const MAX_REASON_BYTES: usize = 512;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
-use crate::approval::Approver;
+use crate::approval::{Approval, Approver};
 use crate::audit::{self, Outcome};
 use crate::policy::{Policy, Verdict};
 use crate::protocol::{Request, Response};
@@ -152,18 +152,25 @@ pub fn handle_request(
         local_mutex = Mutex::new(());
         &local_mutex
     };
-    let human_approved = {
+    let approval = {
         let _guard = gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        approver.approve(req)
+        approver.approve(caller_uid, req)
     };
 
-    if !human_approved {
-        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedUser);
-        return Response::Denied {
-            why: "denied by user".into(),
-        };
+    match approval {
+        Approval::Denied => {
+            audit_best_effort(cfg, caller_uid, req, Outcome::DeniedUser);
+            return Response::Denied {
+                why: "denied by user".into(),
+            };
+        }
+        Approval::Error(why) => {
+            audit_best_effort(cfg, caller_uid, req, Outcome::ApproverError);
+            return Response::Error { why };
+        }
+        Approval::Allowed => {}
     }
 
     // Record the approval for cache and rate tracking.
@@ -405,18 +412,26 @@ mod tests {
     /// Approver that always answers a fixed verdict and counts calls, so we can
     /// assert it was (or was not) consulted.
     struct FakeApprover {
-        answer: bool,
+        answer: Approval,
         calls: Arc<AtomicU32>,
     }
     impl Approver for FakeApprover {
-        fn approve(&self, _req: &Request) -> bool {
+        fn approve(&self, _caller_uid: u32, _req: &Request) -> Approval {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            self.answer
+            match &self.answer {
+                Approval::Allowed => Approval::Allowed,
+                Approval::Denied => Approval::Denied,
+                Approval::Error(e) => Approval::Error(e.clone()),
+            }
         }
 
         fn clone_box(&self) -> Box<dyn Approver> {
             Box::new(Self {
-                answer: self.answer,
+                answer: match &self.answer {
+                    Approval::Allowed => Approval::Allowed,
+                    Approval::Denied => Approval::Denied,
+                    Approval::Error(e) => Approval::Error(e.clone()),
+                },
                 calls: Arc::clone(&self.calls),
             })
         }
@@ -445,7 +460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -474,7 +489,7 @@ mod tests {
         let file_path = dir.path().join("notadir");
         std::fs::write(&file_path, b"x").unwrap();
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -500,7 +515,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -523,7 +538,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: false,
+            answer: Approval::Denied,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -541,11 +556,35 @@ mod tests {
     }
 
     #[test]
+    fn approver_error_yields_response_error_and_audits_approver_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let approver = FakeApprover {
+            answer: Approval::Error("no agent running".into()),
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            None,
+            &RealClock,
+            &req(&["echo", "hi"]),
+        );
+        assert!(matches!(resp, Response::Error { .. }));
+        assert_eq!(approver.calls.load(Ordering::Relaxed), 1);
+        let body = std::fs::read_to_string(&cfg.audit_path).unwrap();
+        assert!(body.contains("approver-error"));
+    }
+
+    #[test]
     fn approved_command_executes_and_returns_output() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let approver = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
@@ -566,6 +605,7 @@ mod tests {
                 assert_eq!(stdout.trim(), "hello");
             }
             Response::Denied { why } => panic!("expected approval, got denial: {why}"),
+            Response::Error { why } => panic!("expected approval, got error: {why}"),
         }
     }
 
@@ -574,7 +614,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
         let yes = FakeApprover {
-            answer: true,
+            answer: Approval::Allowed,
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();

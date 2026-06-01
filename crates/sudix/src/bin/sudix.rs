@@ -99,6 +99,10 @@ fn run() -> Result<i32, String> {
             eprintln!("sudix: denied: {why}");
             Ok(126)
         }
+        Response::Error { why } => {
+            eprintln!("sudix: error: {why}");
+            Ok(125)
+        }
     }
 }
 

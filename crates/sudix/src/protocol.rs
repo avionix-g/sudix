@@ -39,6 +39,9 @@ pub enum Response {
     /// The command was rejected before execution. `why` is safe to show the
     /// agent; it never leaks approver state beyond the denial reason.
     Denied { why: String },
+    /// An internal error prevented the broker from deciding. This is not a
+    /// denial — the human was not consulted.
+    Error { why: String },
 }
 
 impl Request {
@@ -114,6 +117,13 @@ mod tests {
             why: "not allowed".into(),
         };
         assert!(no.to_line().unwrap().contains("\"decision\":\"denied\""));
+
+        let err = Response::Error {
+            why: "no agent running".into(),
+        };
+        let err_line = err.to_line().unwrap();
+        assert!(err_line.contains("\"decision\":\"error\""));
+        assert_eq!(Response::from_line(&err_line).unwrap(), err);
     }
 
     #[test]

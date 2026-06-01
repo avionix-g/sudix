@@ -26,6 +26,7 @@ use crate::protocol::Request;
 /// - `approved-cached` — cache hit; executed without prompting (includes exit code)
 /// - `executed` — freshly approved and executed (includes exit code)
 /// - `execute-error` — spawn or I/O failure after approval
+/// - `approver-error` — the approver failed internally; no dialog was shown
 #[derive(Debug, Clone, Copy)]
 pub enum Outcome {
     DeniedEmpty,
@@ -37,6 +38,7 @@ pub enum Outcome {
     ApprovedCached { exit_code: i32 },
     Executed { exit_code: i32 },
     ExecuteError,
+    ApproverError,
 }
 
 impl Outcome {
@@ -51,6 +53,7 @@ impl Outcome {
             Outcome::ApprovedCached { exit_code } => ("approved-cached", Some(exit_code)),
             Outcome::Executed { exit_code } => ("executed", Some(exit_code)),
             Outcome::ExecuteError => ("execute-error", None),
+            Outcome::ApproverError => ("approver-error", None),
         }
     }
 }

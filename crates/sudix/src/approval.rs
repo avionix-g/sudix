@@ -19,11 +19,20 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use crate::config::ApprovalMethod;
 use crate::protocol::Request;
 
+/// The 3-state result of an approval attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Approval {
+    Allowed,
+    Denied,
+    /// An internal failure prevented a decision. The human was not consulted.
+    Error(String),
+}
+
 /// Something that can ask a human to approve a specific, already-policy-checked
 /// request. Implementations MUST fail closed.
 pub trait Approver: Send + Sync {
-    /// Show the exact command and return `true` only on an explicit "Allow".
-    fn approve(&self, req: &Request) -> bool;
+    /// Show the exact command and return the verdict.
+    fn approve(&self, caller_uid: u32, req: &Request) -> Approval;
     /// Clone into a heap-allocated trait object (for `Arc::from`).
     fn clone_box(&self) -> Box<dyn Approver>;
 }
@@ -65,14 +74,13 @@ fn shell_join(argv: &[String]) -> String {
 pub struct ZenityApprover;
 
 impl Approver for ZenityApprover {
-    fn approve(&self, req: &Request) -> bool {
+    fn approve(&self, _caller_uid: u32, req: &Request) -> Approval {
         // zenity exits 0 for the OK/Allow button, non-zero for Cancel/Deny,
-        // window-close, and timeout. We additionally treat a spawn failure
-        // (zenity missing, no display) as a denial — fail closed.
+        // window-close, and timeout.
         //
         // --no-markup: suppress Pango markup interpretation so agent-controlled
         // reason/cwd fields cannot inject styled or misleading text.
-        Command::new("zenity")
+        match Command::new("zenity")
             .arg("--question")
             .arg("--no-markup")
             .arg("--title=sudix: root access requested")
@@ -82,7 +90,11 @@ impl Approver for ZenityApprover {
             .arg("--default-cancel")
             .arg("--width=500")
             .status()
-            .is_ok_and(|s| s.success())
+        {
+            Ok(s) if s.success() => Approval::Allowed,
+            Ok(_) => Approval::Denied,
+            Err(e) => Approval::Error(format!("zenity spawn failed: {e}")),
+        }
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
@@ -141,12 +153,12 @@ impl TotpApprover {
 }
 
 impl Approver for TotpApprover {
-    fn approve(&self, req: &Request) -> bool {
+    fn approve(&self, _caller_uid: u32, req: &Request) -> Approval {
         let Some(code) = req.otp.as_deref() else {
-            return false; // No code provided → fail closed.
+            return Approval::Denied;
         };
         if !self.totp.check_current(code).unwrap_or(false) {
-            return false;
+            return Approval::Denied;
         }
         // Compute the counter value for the current time step.
         let step = self.totp.step;
@@ -160,9 +172,9 @@ impl Approver for TotpApprover {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !used.insert(counter) {
-            return false; // Code already used this time step.
+            return Approval::Denied; // Code already used this time step.
         }
-        true
+        Approval::Allowed
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
@@ -284,7 +296,7 @@ mod tests {
             reason: "test".into(),
             otp: Some(code),
         };
-        assert!(approver.approve(&req));
+        assert_eq!(approver.approve(1000, &req), Approval::Allowed);
     }
 
     #[test]
@@ -304,14 +316,14 @@ mod tests {
             reason: "test".into(),
             otp: Some(code.clone()),
         };
-        assert!(approver.approve(&req), "first use must succeed");
+        assert_eq!(approver.approve(1000, &req), Approval::Allowed, "first use must succeed");
         let req2 = Request {
             argv: vec!["whoami".into()],
             cwd: "/".into(),
             reason: "test".into(),
             otp: Some(code),
         };
-        assert!(!approver.approve(&req2), "replay must be rejected");
+        assert_eq!(approver.approve(1000, &req2), Approval::Denied, "replay must be rejected");
     }
 
     #[test]
@@ -329,7 +341,7 @@ mod tests {
             reason: "test".into(),
             otp: Some("000000".into()),
         };
-        assert!(!approver.approve(&req));
+        assert_eq!(approver.approve(1000, &req), Approval::Denied);
     }
 
     #[test]
@@ -341,6 +353,6 @@ mod tests {
                 std::collections::HashSet::new(),
             )),
         };
-        assert!(!approver.approve(&req())); // otp = None
+        assert_eq!(approver.approve(1000, &req()), Approval::Denied); // otp = None
     }
 }

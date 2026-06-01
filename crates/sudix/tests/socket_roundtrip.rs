@@ -11,7 +11,7 @@ use std::thread;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sudix::approval::Approver;
+use sudix::approval::{Approval, Approver};
 use sudix::policy::{Policy, Rule};
 use sudix::protocol::{Request, Response};
 use sudix::scoping::RuleScope;
@@ -20,8 +20,8 @@ use sudix::server::{Config, serve};
 /// Always-allow approver for the happy path.
 struct AlwaysAllow;
 impl Approver for AlwaysAllow {
-    fn approve(&self, _req: &Request) -> bool {
-        true
+    fn approve(&self, _caller_uid: u32, _req: &Request) -> Approval {
+        Approval::Allowed
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
@@ -36,7 +36,7 @@ struct SlowApprover {
 }
 
 impl Approver for SlowApprover {
-    fn approve(&self, _req: &Request) -> bool {
+    fn approve(&self, _caller_uid: u32, _req: &Request) -> Approval {
         let c = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
         let mut max = self.max_seen.load(Ordering::SeqCst);
         while c > max {
@@ -50,7 +50,7 @@ impl Approver for SlowApprover {
         }
         thread::sleep(std::time::Duration::from_millis(20));
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
-        true
+        Approval::Allowed
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
@@ -125,6 +125,7 @@ fn approved_command_runs_over_the_socket() {
             assert_eq!(stdout.trim(), "roundtrip");
         }
         Response::Denied { why } => panic!("unexpected denial: {why}"),
+        Response::Error { why } => panic!("unexpected error: {why}"),
     }
 }
 
@@ -151,6 +152,7 @@ fn wrong_uid_is_rejected_before_policy() {
     match send(&socket, &req(&["echo", "hi"])) {
         Response::Denied { why } => assert!(why.contains("uid")),
         Response::Approved { .. } => panic!("connection from wrong uid was approved"),
+        Response::Error { why } => panic!("unexpected error: {why}"),
     }
 }
 
