@@ -8,7 +8,7 @@ A coding agent running under your user account sometimes needs root. The usual
 options all hand it more than you want:
 
 - `NOPASSWD` sudoers → unattended, unbounded root.
-- A stored password (à la askpass helpers) → after one approval the agent holds
+- A stored password (a la askpass helpers) → after one approval the agent holds
   a reusable root credential, and the "security checks" guarding it (cwd,
   parent-process name, env vars) are all forgeable *by the agent*.
 
@@ -85,7 +85,3 @@ Sketch / proof of concept. Known gaps before this is production-worthy:
   dialog blocks other requests).
 - `cwd` is taken from the client and used verbatim for execution — it is
   attacker-influenced context, not validated.
-
-## License
-
-MIT OR Apache-2.0.
