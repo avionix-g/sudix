@@ -3,7 +3,7 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -56,6 +56,21 @@ pub fn handle_request(
         Verdict::Allowed => {}
     }
 
+    // Validate and canonicalize cwd before showing it to the human or using it
+    // in exec — the client supplies this value and it must not be trusted raw.
+    let Ok(cwd) = std::fs::canonicalize(&req.cwd) else {
+        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
+        return Response::Denied {
+            why: "invalid working directory".into(),
+        };
+    };
+    if !cwd.is_dir() {
+        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
+        return Response::Denied {
+            why: "invalid working directory".into(),
+        };
+    }
+
     if !approver.approve(req) {
         audit_best_effort(cfg, caller_uid, req, "denied-user");
         return Response::Denied {
@@ -63,7 +78,7 @@ pub fn handle_request(
         };
     }
 
-    match execute(req) {
+    match execute(req, &cwd) {
         Ok((exit_code, stdout, stderr)) => {
             audit_best_effort(cfg, caller_uid, req, "executed");
             Response::Approved {
@@ -84,10 +99,10 @@ pub fn handle_request(
 /// Run the approved command. The daemon runs as root, so the child inherits
 /// root; we do not shell out — `argv` is passed directly to `execvp`, so there
 /// is no shell-injection surface.
-fn execute(req: &Request) -> io::Result<(i32, String, String)> {
+fn execute(req: &Request, cwd: &Path) -> io::Result<(i32, String, String)> {
     let output = Command::new(&req.argv[0])
         .args(&req.argv[1..])
-        .current_dir(&req.cwd)
+        .current_dir(cwd)
         .output()?;
     let code = output.status.code().unwrap_or(-1);
     Ok((
@@ -218,6 +233,53 @@ mod tests {
             cwd: ".".into(),
             reason: "test".into(),
         }
+    }
+
+    fn req_with_cwd(parts: &[&str], cwd: &str) -> Request {
+        Request {
+            argv: parts.iter().map(|s| (*s).to_string()).collect(),
+            cwd: cwd.to_string(),
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn nonexistent_cwd_denied_before_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let approver = FakeApprover {
+            answer: true,
+            calls: Cell::new(0),
+        };
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &req_with_cwd(&["echo", "hi"], "/no/such/directory/ever"),
+        );
+        assert!(matches!(resp, Response::Denied { .. }));
+        assert_eq!(approver.calls.get(), 0, "approver must not be consulted");
+    }
+
+    #[test]
+    fn file_as_cwd_denied_before_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        // Create a regular file to use as "cwd".
+        let file_path = dir.path().join("notadir");
+        std::fs::write(&file_path, b"x").unwrap();
+        let approver = FakeApprover {
+            answer: true,
+            calls: Cell::new(0),
+        };
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &req_with_cwd(&["echo", "hi"], file_path.to_str().unwrap()),
+        );
+        assert!(matches!(resp, Response::Denied { .. }));
+        assert_eq!(approver.calls.get(), 0, "approver must not be consulted");
     }
 
     #[test]
