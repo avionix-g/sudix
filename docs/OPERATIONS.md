@@ -3,7 +3,7 @@
 ## Toolchain
 
 - **Rust:** `rust-version = "1.95"` (edition 2024)
-- **System tools:** `zenity` at runtime (for `method = "zenity"`); not needed at build time.
+- **System tools:** `zenity` at runtime (for `method = "agent"`, run inside the graphical session by `sudix-agent`); not needed at build time.
 - **`just`:** the `justfile` provides the standard recipes.
 
 ## Building
@@ -14,7 +14,7 @@ cargo build --release
 just build
 ```
 
-Produced binaries: `target/release/sudixd` and `target/release/sudix`.
+Produced binaries: `target/release/sudixd`, `target/release/sudix`, and `target/release/sudix-agent`.
 
 ## Testing
 
@@ -82,15 +82,15 @@ sudo chmod 644 /etc/sudix/policy.toml   # 640 is also fine; never 666 or 664
 ```
 
 Edit `/etc/sudix/policy.toml`:
-- Set `agent_uids` to the uid(s) of the coding agent.
-- Set `approver_uids` to the uid(s) of the human approver.
-- Choose `method = "zenity"` (desktop) or `method = "totp"` (headless).
+- Set `agent_uids` to the uid(s) of the coding agent and the human approver (same uid for a single-user desktop).
+- Set `approver_uids` to the same uid(s).
+- Choose `method = "agent"` (desktop GUI via `sudix-agent`) or `method = "totp"` (headless).
 - Adjust the `[[allow]]` rules and `hard_deny` list.
 
 **Security checklist:**
 - Verify the allowlist covers only low-blast-radius commands.
 - Verify `agent_uids` and `approver_uids` reflect the actual deployment.
-- If sets are disjoint, `method = "totp"` is required (the daemon enforces this).
+- For headless/CI deployments, use `method = "totp"` and `sudo sudixd enroll`.
 - Confirm the file is owned by root and not world-writable.
 
 ### 4. Enroll TOTP (headless deployments only)
@@ -104,33 +104,103 @@ sudo sudixd enroll
 
 ### 5. Install systemd units
 
+Install the system broker (runs as root, socket-activated):
+
 ```sh
 sudo install -o root -g root -m 644 \
     dist/systemd/sudixd.service dist/systemd/sudixd.socket \
-    /etc/systemd/system/
+    /usr/lib/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sudixd.socket
 ```
 
-Verify:
+Install the per-user approval agent (runs in the graphical session):
 
 ```sh
-systemd-analyze verify /etc/systemd/system/sudixd.service
+sudo install -o root -g root -m 644 \
+    dist/systemd/sudix-agent.service \
+    /usr/lib/systemd/user/
+sudo install -o root -g root -m 644 \
+    dist/systemd/90-sudix.preset \
+    /usr/lib/systemd/user-preset/
+```
+
+The preset auto-enables `sudix-agent.service` for each user on their next
+`systemctl --user preset` run (which happens automatically at package install
+and first login on systems that run `systemd-sysusers`):
+
+```sh
+systemctl --user preset sudix-agent.service
+systemctl --user start sudix-agent.service
+systemctl --user is-enabled sudix-agent   # should print "enabled"
+```
+
+Verify the broker:
+
+```sh
+systemd-analyze verify /usr/lib/systemd/system/sudixd.service
 systemctl status sudixd.socket
 ```
 
-### 6. Smoke test
+**Socket mode:** `sudixd.socket` uses `SocketMode=0666`. Authorization is
+enforced by `SO_PEERCRED` (`cfg.agent_uids`), not by the socket's filesystem
+permissions. The 0666 mode allows any user to attempt a connection; uids not
+in `agent_uids` are refused immediately before policy is consulted. Tighten to
+`0660` + `SocketGroup=sudix` if defense-in-depth at the filesystem level is
+required for your threat model.
+
+### 6. Install `sudix-agent` binary
+
+```sh
+sudo install -o root -g root -m 755 target/release/sudix-agent /usr/bin/sudix-agent
+```
+
+### 7. Smoke test
+
+For `method = "agent"` (desktop):
 
 ```sh
 sudix -- id
-# Should prompt for approval (zenity) or request --otp (totp) and return uid info.
+# sudix-agent shows a zenity dialog; Allow → prints uid info, exit 0
+#                                     Deny  → "sudix: denied: denied by user", exit 126
+# No agent running → "sudix: error: no approval agent running …", exit 125
 ```
+
+For `method = "totp"` (headless):
+
+```sh
+sudix --otp <code> -- id   # correct code → runs; wrong code → exit 126
+```
+
+**Exit codes:**
+- `0` — command ran; exit code is forwarded from the subprocess.
+- `125` — approver error (agent not running, spawn failure). Not a denial.
+- `126` — explicitly denied by the approver (user clicked Deny or wrong TOTP code).
 
 ### Running without systemd
 
 ```sh
-sudo SUDIX_RUNTIME_DIR=/run/sudix sudixd
+sudo SUDIX_RUNTIME_DIR=/run/sudix sudixd &
+sudix-agent &   # run in the graphical session as the normal user
 ```
 
 The daemon creates `/run/sudix/` if it doesn't exist and binds
 `/run/sudix/sudixd.sock`. Audit log: `/run/sudix/audit.log`.
+
+### The per-user approval agent (`sudix-agent`)
+
+`sudix-agent` must run in the user's graphical session. It:
+
+1. Connects to the broker socket (`$SUDIX_SOCKET`, default `/run/sudix/sudixd.sock`).
+2. Registers as the approver for its uid via `Hello::RegisterAgent`.
+3. Waits for `Prompt` messages from the broker and shows a `zenity` dialog for each.
+4. Sends `Verdict::Allow` or `Verdict::Deny` (or `Verdict::Error` on spawn failure).
+5. Reconnects with bounded backoff (1 s → 30 s) if the broker closes the connection.
+
+The systemd user service (`WantedBy=graphical-session.target`) starts it
+automatically when a graphical session opens. The preset (`90-sudix.preset`)
+enables it without requiring user action after package install.
+
+If `sudix-agent` is not running when a request arrives, the broker waits up to
+10 seconds for it to register, then returns `Response::Error` — never a silent
+denial.

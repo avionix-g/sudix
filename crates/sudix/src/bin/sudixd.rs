@@ -17,13 +17,13 @@ use std::process::ExitCode;
 
 use listenfd::ListenFd;
 
-use sudix::approval::approver_for;
+use sudix::approval::{AgentApprover, approver_for};
 use sudix::config::{self, FileConfig};
 use sudix::scoping::RuleScope;
-use sudix::server::{Config, serve, serve_on};
+use sudix::server::{Config, serve, serve_on, serve_on_with_registry, serve_with_registry};
 
 fn main() -> ExitCode {
-    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     if raw_args.first().map(String::as_str) == Some("default-config") {
         print!("{}", config::default_config_toml());
@@ -42,30 +42,31 @@ fn main() -> ExitCode {
         eprintln!("usage: sudixd [default-config | enroll [--force]]");
         return ExitCode::FAILURE;
     }
-    raw_args.clear();
+
+    match run_daemon() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("sudixd: fatal: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon() -> std::io::Result<()> {
+    use std::io::Error;
 
     let config_path =
         std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
 
-    let file_cfg = match FileConfig::load(std::path::Path::new(&config_path)) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("sudixd: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let file_cfg = FileConfig::load(std::path::Path::new(&config_path))
+        .map_err(|e| Error::other(e.to_string()))?;
 
-    let approver = match approver_for(
+    let static_approver = approver_for(
         &file_cfg.approval.method,
         file_cfg.approval.totp_secret_path.as_deref(),
         true,
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("sudixd: approval setup failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    )
+    .map_err(|e| Error::other(format!("approval setup failed: {e}")))?;
 
     let runtime_dir = std::env::var("SUDIX_RUNTIME_DIR").unwrap_or_else(|_| "/run/sudix".into());
     let rule_scopes = file_cfg
@@ -84,29 +85,42 @@ fn main() -> ExitCode {
         audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
     };
 
-    // Prefer a pre-bound listener from systemd socket activation. If none is
-    // available, bind the socket ourselves (and create the runtime dir first).
-    let result = if let Some(listener) = try_systemd_listener() {
-        eprintln!(
-            "sudixd: using systemd-passed socket (agent uids: {:?})",
-            cfg.agent_uids
-        );
-        serve_on(&listener, &cfg, approver.as_ref())
-    } else {
-        if let Some(parent) = cfg.socket_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            eprintln!("sudixd: cannot create {}: {e}", parent.display());
-            return ExitCode::FAILURE;
+    if let Some(approver) = static_approver {
+        // Static approver (totp): use the standard serve path.
+        if let Some(listener) = try_systemd_listener() {
+            eprintln!(
+                "sudixd: using systemd-passed socket (agent uids: {:?})",
+                cfg.agent_uids
+            );
+            serve_on(&listener, &cfg, approver.as_ref())
+        } else {
+            if let Some(parent) = cfg.socket_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            serve(&cfg, approver.as_ref())
         }
-        serve(&cfg, approver.as_ref())
-    };
+    } else {
+        // Agent method: share registry between AgentApprover and server.
+        let registry = std::sync::Arc::new((
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+            std::sync::Condvar::new(),
+        ));
+        let approver = AgentApprover {
+            registry: std::sync::Arc::clone(&registry),
+            register_wait: std::time::Duration::from_secs(10),
+        };
 
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("sudixd: fatal: {e}");
-            ExitCode::FAILURE
+        if let Some(listener) = try_systemd_listener() {
+            eprintln!(
+                "sudixd: using systemd-passed socket (agent uids: {:?})",
+                cfg.agent_uids
+            );
+            serve_on_with_registry(&listener, &cfg, &approver, &registry)
+        } else {
+            if let Some(parent) = cfg.socket_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            serve_with_registry(&cfg, &approver, &registry)
         }
     }
 }

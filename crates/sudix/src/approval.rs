@@ -214,21 +214,24 @@ fn check_secret_permissions(path: &Path) -> std::io::Result<()> {
 
 /// Construct the right [`Approver`] from config.
 ///
+/// Returns `Ok(None)` for `ApprovalMethod::Agent` — the caller must build
+/// an [`AgentApprover`] with the shared registry instead.
+///
 /// # Errors
 /// Returns a string describing the problem if TOTP setup fails.
 pub fn approver_for(
     method: &ApprovalMethod,
     totp_secret_path: Option<&str>,
     enforce_perms: bool,
-) -> Result<Box<dyn Approver + Send + Sync>, String> {
+) -> Result<Option<Box<dyn Approver + Send + Sync>>, String> {
     match method {
-        ApprovalMethod::Zenity => Ok(Box::new(ZenityApprover)),
+        ApprovalMethod::Agent => Ok(None),
         ApprovalMethod::Totp => {
             let path_str = totp_secret_path
                 .ok_or_else(|| "TOTP method requires totp_secret_path".to_string())?;
             let path = Path::new(path_str);
             TotpApprover::from_secret_file_inner(path, enforce_perms)
-                .map(|a| Box::new(a) as Box<dyn Approver + Send + Sync>)
+                .map(|a| Some(Box::new(a) as Box<dyn Approver + Send + Sync>))
         }
     }
 }
@@ -239,6 +242,8 @@ const AGENT_PROMPT_TIMEOUT_SECS: u64 = 300;
 /// A live connection to a registered per-user approval agent.
 pub struct AgentHandle {
     stream: Mutex<UnixStream>,
+    /// Signals when the agent has disconnected (prompt got EOF or error).
+    disconnected: (Mutex<bool>, Condvar),
 }
 
 impl AgentHandle {
@@ -246,7 +251,29 @@ impl AgentHandle {
     pub fn new(stream: UnixStream) -> Self {
         Self {
             stream: Mutex::new(stream),
+            disconnected: (Mutex::new(false), Condvar::new()),
         }
+    }
+
+    /// Block until the agent disconnects (prompt got EOF or error, or stream closed).
+    pub fn wait_until_disconnected(&self) {
+        let (ref lock, ref cv) = self.disconnected;
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            cv.wait_while(guard, |d| !*d)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
+    fn signal_disconnected(&self) {
+        let (ref lock, ref cv) = self.disconnected;
+        let mut d = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *d = true;
+        cv.notify_all();
     }
 
     /// Send a prompt and wait for a verdict. Serializes concurrent callers.
@@ -260,23 +287,29 @@ impl AgentHandle {
             Err(e) => return Approval::Error(format!("failed to serialize prompt: {e}")),
         };
         if let Err(e) = guard.write_all(line.as_bytes()) {
+            self.signal_disconnected();
             return Approval::Error(format!("failed to send prompt to agent: {e}"));
         }
         if let Err(e) = guard.flush() {
+            self.signal_disconnected();
             return Approval::Error(format!("failed to flush prompt to agent: {e}"));
         }
-        if let Err(e) =
-            guard.set_read_timeout(Some(Duration::from_secs(AGENT_PROMPT_TIMEOUT_SECS)))
+        if let Err(e) = guard.set_read_timeout(Some(Duration::from_secs(AGENT_PROMPT_TIMEOUT_SECS)))
         {
             return Approval::Error(format!("set_read_timeout failed: {e}"));
         }
         let mut reader = BufReader::new(&*guard);
         let mut verdict_line = String::new();
-        if let Err(e) = reader.read_line(&mut verdict_line) {
-            return Approval::Error(format!("approval agent timed out or disconnected: {e}"));
-        }
-        if verdict_line.is_empty() {
-            return Approval::Error("approval agent disconnected".into());
+        match reader.read_line(&mut verdict_line) {
+            Err(e) => {
+                self.signal_disconnected();
+                return Approval::Error(format!("approval agent timed out or disconnected: {e}"));
+            }
+            Ok(0) => {
+                self.signal_disconnected();
+                return Approval::Error("approval agent disconnected".into());
+            }
+            Ok(_) => {}
         }
         match Verdict::from_line(&verdict_line) {
             Ok(Verdict::Allow) => Approval::Allowed,
@@ -304,7 +337,9 @@ impl Approver for AgentApprover {
         // Wait up to register_wait for the agent to appear.
         let deadline = std::time::Instant::now() + self.register_wait;
         let handle = loop {
-            let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(h) = guard.get(&caller_uid) {
                 break Arc::clone(h);
             }
@@ -426,14 +461,22 @@ mod tests {
             reason: "test".into(),
             otp: Some(code.clone()),
         };
-        assert_eq!(approver.approve(1000, &req), Approval::Allowed, "first use must succeed");
+        assert_eq!(
+            approver.approve(1000, &req),
+            Approval::Allowed,
+            "first use must succeed"
+        );
         let req2 = Request {
             argv: vec!["whoami".into()],
             cwd: "/".into(),
             reason: "test".into(),
             otp: Some(code),
         };
-        assert_eq!(approver.approve(1000, &req2), Approval::Denied, "replay must be rejected");
+        assert_eq!(
+            approver.approve(1000, &req2),
+            Approval::Denied,
+            "replay must be rejected"
+        );
     }
 
     #[test]
@@ -500,10 +543,15 @@ mod tests {
         fake_agent(agent_side, Verdict::Allow);
         {
             let (ref lock, ref cv) = *registry;
-            lock.lock().unwrap().insert(1000, Arc::new(AgentHandle::new(broker_side)));
+            lock.lock()
+                .unwrap()
+                .insert(1000, Arc::new(AgentHandle::new(broker_side)));
             cv.notify_all();
         }
-        let approver = AgentApprover { registry, register_wait: Duration::from_millis(50) };
+        let approver = AgentApprover {
+            registry,
+            register_wait: Duration::from_millis(50),
+        };
         assert_eq!(approver.approve(1000, &agent_req()), Approval::Allowed);
     }
 
@@ -514,10 +562,15 @@ mod tests {
         fake_agent(agent_side, Verdict::Deny);
         {
             let (ref lock, ref cv) = *registry;
-            lock.lock().unwrap().insert(1000, Arc::new(AgentHandle::new(broker_side)));
+            lock.lock()
+                .unwrap()
+                .insert(1000, Arc::new(AgentHandle::new(broker_side)));
             cv.notify_all();
         }
-        let approver = AgentApprover { registry, register_wait: Duration::from_millis(50) };
+        let approver = AgentApprover {
+            registry,
+            register_wait: Duration::from_millis(50),
+        };
         assert_eq!(approver.approve(1000, &agent_req()), Approval::Denied);
     }
 
@@ -525,14 +578,27 @@ mod tests {
     fn agent_approver_error_from_agent() {
         let registry = make_registry();
         let (broker_side, agent_side) = UnixStream::pair().unwrap();
-        fake_agent(agent_side, Verdict::Error { why: "no display".into() });
+        fake_agent(
+            agent_side,
+            Verdict::Error {
+                why: "no display".into(),
+            },
+        );
         {
             let (ref lock, ref cv) = *registry;
-            lock.lock().unwrap().insert(1000, Arc::new(AgentHandle::new(broker_side)));
+            lock.lock()
+                .unwrap()
+                .insert(1000, Arc::new(AgentHandle::new(broker_side)));
             cv.notify_all();
         }
-        let approver = AgentApprover { registry, register_wait: Duration::from_millis(50) };
-        assert!(matches!(approver.approve(1000, &agent_req()), Approval::Error(_)));
+        let approver = AgentApprover {
+            registry,
+            register_wait: Duration::from_millis(50),
+        };
+        assert!(matches!(
+            approver.approve(1000, &agent_req()),
+            Approval::Error(_)
+        ));
     }
 
     #[test]

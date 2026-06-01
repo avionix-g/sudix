@@ -42,10 +42,10 @@ fn run_agent(socket_path: &str) -> Result<(), String> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("cannot reach broker at {socket_path}: {e}"))?;
 
-    let hello = Hello::RegisterAgent
-        .to_line()
+    let hello = Hello::RegisterAgent.to_line().map_err(|e| e.to_string())?;
+    stream
+        .write_all(hello.as_bytes())
         .map_err(|e| e.to_string())?;
-    stream.write_all(hello.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
     eprintln!("sudix-agent: registered with broker at {socket_path}");

@@ -1,0 +1,11 @@
+[Unit]
+Description=sudix per-user approval agent
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/sudix-agent
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

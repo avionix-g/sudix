@@ -42,7 +42,6 @@ pub struct Config {
     pub audit_path: PathBuf,
 }
 
-
 /// Decide and (if approved) execute a request. This is the heart of the broker,
 /// kept free of any socket concerns so it can be unit-tested with a fake
 /// [`Approver`].
@@ -240,25 +239,39 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
     serve_on(&listener, cfg, approver)
 }
 
-/// Serve connections on an already-bound listener.
+/// Bind the socket and serve connections forever, using the given registry.
+///
+/// Used when the caller must share the same registry with the [`AgentApprover`]
+/// it passes in. For the TOTP/static path, use [`serve`] instead.
 ///
 /// # Errors
-/// See [`serve`].
-///
-/// Splits socket binding from serving so integration tests can inject their own
-/// listener, and so systemd socket activation can hand over a pre-bound fd.
-///
-/// Each connection gets its own thread. The human-facing approval step is
-/// serialized via a dedicated mutex so at most one dialog is outstanding at a
-/// time. Cache/rate state updates take a separate short-lived lock.
-///
-/// Lock ordering (never hold both simultaneously):
-///   `approval_mutex` first, then `state_mutex` in a separate lock scope.
+/// Returns an error only if the socket cannot be bound.
+pub fn serve_with_registry(
+    cfg: &Config,
+    approver: &dyn Approver,
+    registry: &Arc<AgentRegistry>,
+) -> io::Result<()> {
+    let _stale = std::fs::remove_file(&cfg.socket_path);
+    let listener = UnixListener::bind(&cfg.socket_path)?;
+    restrict_socket_permissions(&cfg.socket_path)?;
+    eprintln!(
+        "sudixd: listening on {} (agent uids: {:?})",
+        cfg.socket_path.display(),
+        cfg.agent_uids
+    );
+    serve_on_with_registry(&listener, cfg, approver, registry)
+}
+
+/// Serve connections on an already-bound listener, using the given registry.
 ///
 /// # Errors
-/// Returns an error only if `listener.incoming()` itself fails unrecoverably
-/// (in practice this means the listener was already closed).
-pub fn serve_on(listener: &UnixListener, cfg: &Config, base_approver: &dyn Approver) -> io::Result<()> {
+/// See [`serve_on`].
+pub fn serve_on_with_registry(
+    listener: &UnixListener,
+    cfg: &Config,
+    base_approver: &dyn Approver,
+    registry: &Arc<AgentRegistry>,
+) -> io::Result<()> {
     let cfg = Arc::new(cfg.clone());
     let base_approver: Arc<dyn Approver> = Arc::from(base_approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
@@ -266,8 +279,6 @@ pub fn serve_on(listener: &UnixListener, cfg: &Config, base_approver: &dyn Appro
     let approval_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     // Counting semaphore: limits concurrent threads to MAX_CONCURRENT.
     let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0usize), Condvar::new()));
-    // Registry of live per-user agent connections.
-    let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
 
     for conn in listener.incoming() {
         let stream = match conn {
@@ -295,7 +306,7 @@ pub fn serve_on(listener: &UnixListener, cfg: &Config, base_approver: &dyn Appro
         let state2 = Arc::clone(&state);
         let amtx2 = Arc::clone(&approval_mutex);
         let sem2 = Arc::clone(&sem);
-        let registry2 = Arc::clone(&registry);
+        let registry2 = Arc::clone(registry);
 
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -323,6 +334,33 @@ pub fn serve_on(listener: &UnixListener, cfg: &Config, base_approver: &dyn Appro
         });
     }
     Ok(())
+}
+
+/// Serve connections on an already-bound listener.
+///
+/// # Errors
+/// See [`serve`].
+///
+/// Splits socket binding from serving so integration tests can inject their own
+/// listener, and so systemd socket activation can hand over a pre-bound fd.
+///
+/// Each connection gets its own thread. The human-facing approval step is
+/// serialized via a dedicated mutex so at most one dialog is outstanding at a
+/// time. Cache/rate state updates take a separate short-lived lock.
+///
+/// Lock ordering (never hold both simultaneously):
+///   `approval_mutex` first, then `state_mutex` in a separate lock scope.
+///
+/// # Errors
+/// Returns an error only if `listener.incoming()` itself fails unrecoverably
+/// (in practice this means the listener was already closed).
+pub fn serve_on(
+    listener: &UnixListener,
+    cfg: &Config,
+    base_approver: &dyn Approver,
+) -> io::Result<()> {
+    let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    serve_on_with_registry(listener, cfg, base_approver, &registry)
 }
 
 /// Lock the socket to owner-only access (0600). Defense in depth: the peer-cred
@@ -382,26 +420,22 @@ fn handle_connection_threaded(
             let handle = Arc::new(AgentHandle::new(stream.try_clone()?));
             {
                 let (ref lock, ref cv) = **registry;
-                let mut reg = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut reg = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 reg.insert(caller_uid, Arc::clone(&handle));
                 cv.notify_all();
             }
 
-            // Keep the connection alive until the agent disconnects.
-            // The broker writes prompts via AgentHandle::prompt(); we only
-            // need to detect disconnection here.
-            let mut buf = [0u8; 1];
-            let mut owned = stream.try_clone()?;
-            loop {
-                match owned.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
+            // Block until the agent disconnects; AgentHandle::prompt signals
+            // disconnection when it gets EOF or an I/O error.
+            handle.wait_until_disconnected();
 
             // Remove from registry on disconnect.
             let (ref lock, _) = **registry;
-            let mut reg = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reg = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             reg.remove(&caller_uid);
             Ok(())
         }
@@ -695,8 +729,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
-        let registry: Arc<AgentRegistry> =
-            Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
         let approver = AgentApprover {
             registry,
             register_wait: Duration::from_millis(50),

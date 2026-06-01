@@ -296,7 +296,17 @@ mod tests {
             let line = v.to_line().unwrap();
             assert_eq!(Verdict::from_line(&line).unwrap(), v);
         }
-        assert!(Verdict::Allow.to_line().unwrap().contains("\"verdict\":\"allow\""));
-        assert!(Verdict::Deny.to_line().unwrap().contains("\"verdict\":\"deny\""));
+        assert!(
+            Verdict::Allow
+                .to_line()
+                .unwrap()
+                .contains("\"verdict\":\"allow\"")
+        );
+        assert!(
+            Verdict::Deny
+                .to_line()
+                .unwrap()
+                .contains("\"verdict\":\"deny\"")
+        );
     }
 }
