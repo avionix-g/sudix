@@ -1,6 +1,7 @@
 //! The broker daemon: socket loop, peer-credential auth, and the
 //! policy → approval → execute → audit pipeline.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ const MAX_REASON_BYTES: usize = 512;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
-use crate::approval::{Approval, Approver};
+use crate::approval::{AgentHandle, AgentRegistry, Approval, Approver};
 use crate::audit::{self, Outcome};
 use crate::policy::{Policy, Verdict};
 use crate::protocol::{Hello, Request, Response};
@@ -40,6 +41,7 @@ pub struct Config {
     /// Append-only audit log path.
     pub audit_path: PathBuf,
 }
+
 
 /// Decide and (if approved) execute a request. This is the heart of the broker,
 /// kept free of any socket concerns so it can be unit-tested with a fake
@@ -256,14 +258,16 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
 /// # Errors
 /// Returns an error only if `listener.incoming()` itself fails unrecoverably
 /// (in practice this means the listener was already closed).
-pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
+pub fn serve_on(listener: &UnixListener, cfg: &Config, base_approver: &dyn Approver) -> io::Result<()> {
     let cfg = Arc::new(cfg.clone());
-    let approver: Arc<dyn Approver> = Arc::from(approver.clone_box());
+    let base_approver: Arc<dyn Approver> = Arc::from(base_approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
     // Serializes the blocking human-approval step so only one dialog shows at a time.
     let approval_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     // Counting semaphore: limits concurrent threads to MAX_CONCURRENT.
     let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0usize), Condvar::new()));
+    // Registry of live per-user agent connections.
+    let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
 
     for conn in listener.incoming() {
         let stream = match conn {
@@ -287,16 +291,22 @@ pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) 
         }
 
         let cfg2 = Arc::clone(&cfg);
-        let approver2 = Arc::clone(&approver);
+        let base_approver2 = Arc::clone(&base_approver);
         let state2 = Arc::clone(&state);
         let amtx2 = Arc::clone(&approval_mutex);
         let sem2 = Arc::clone(&sem);
+        let registry2 = Arc::clone(&registry);
 
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Err(e) =
-                    handle_connection_threaded(&cfg2, &*approver2, &state2, &amtx2, &stream)
-                {
+                if let Err(e) = handle_connection_threaded(
+                    &cfg2,
+                    &*base_approver2,
+                    &state2,
+                    &amtx2,
+                    &registry2,
+                    &stream,
+                ) {
                     eprintln!("sudixd: connection error: {e}");
                 }
             }));
@@ -325,9 +335,10 @@ fn restrict_socket_permissions(path: &std::path::Path) -> io::Result<()> {
 
 fn handle_connection_threaded(
     cfg: &Config,
-    approver: &dyn Approver,
+    base_approver: &dyn Approver,
     state: &Mutex<ApprovalState>,
     approval_mutex: &Mutex<()>,
+    registry: &Arc<AgentRegistry>,
     stream: &UnixStream,
 ) -> io::Result<()> {
     let caller_uid = peer_uid(stream)?;
@@ -353,27 +364,54 @@ fn handle_connection_threaded(
     }
 
     let clock = RealClock;
-    let resp = match Hello::from_line(&line) {
-        Ok(Hello::Command(req)) => handle_request(
-            cfg,
-            caller_uid,
-            approver,
-            state,
-            Some(approval_mutex),
-            &clock,
-            &req,
-        ),
-        Ok(Hello::RegisterAgent) => {
-            // Agent registration is handled in Step 3; stub for now.
-            Response::Error {
-                why: "agent registration not yet implemented".into(),
-            }
+    match Hello::from_line(&line) {
+        Ok(Hello::Command(req)) => {
+            let resp = handle_request(
+                cfg,
+                caller_uid,
+                base_approver,
+                state,
+                Some(approval_mutex),
+                &clock,
+                &req,
+            );
+            write_response(stream, &resp)
         }
-        Err(e) => Response::Denied {
-            why: format!("malformed request: {e}"),
-        },
-    };
-    write_response(stream, &resp)
+        Ok(Hello::RegisterAgent) => {
+            // Insert this connection as the live agent for caller_uid.
+            let handle = Arc::new(AgentHandle::new(stream.try_clone()?));
+            {
+                let (ref lock, ref cv) = **registry;
+                let mut reg = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                reg.insert(caller_uid, Arc::clone(&handle));
+                cv.notify_all();
+            }
+
+            // Keep the connection alive until the agent disconnects.
+            // The broker writes prompts via AgentHandle::prompt(); we only
+            // need to detect disconnection here.
+            let mut buf = [0u8; 1];
+            let mut owned = stream.try_clone()?;
+            loop {
+                match owned.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+
+            // Remove from registry on disconnect.
+            let (ref lock, _) = **registry;
+            let mut reg = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.remove(&caller_uid);
+            Ok(())
+        }
+        Err(e) => {
+            let resp = Response::Denied {
+                why: format!("malformed request: {e}"),
+            };
+            write_response(stream, &resp)
+        }
+    }
 }
 
 /// Authenticate the connecting process by kernel-vouched credentials. The uid
@@ -646,5 +684,36 @@ mod tests {
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("executed"));
         assert!(body.contains("denied-policy"));
+    }
+
+    #[test]
+    fn agent_approver_no_agent_yields_response_error() {
+        use crate::approval::{AgentApprover, AgentRegistry};
+        use std::collections::HashMap;
+        use std::sync::Condvar;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path());
+        let registry: Arc<AgentRegistry> =
+            Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let approver = AgentApprover {
+            registry,
+            register_wait: Duration::from_millis(50),
+        };
+        let state = no_scoping();
+        let resp = handle_request(
+            &cfg,
+            1000,
+            &approver,
+            &state,
+            None,
+            &RealClock,
+            &req(&["echo", "hi"]),
+        );
+        assert!(
+            matches!(resp, Response::Error { .. }),
+            "expected Error, got {resp:?}"
+        );
     }
 }

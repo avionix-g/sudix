@@ -8,16 +8,18 @@
 //! The [`Approver`] trait exists so the server can be driven by a scripted
 //! approver in tests; production uses [`ZenityApprover`] or [`TotpApprover`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use totp_rs::{Algorithm, Secret, TOTP};
 
 use crate::config::ApprovalMethod;
-use crate::protocol::Request;
+use crate::protocol::{Prompt, Request, Verdict};
 
 /// The 3-state result of an approval attempt.
 #[derive(Debug, PartialEq, Eq)]
@@ -230,6 +232,113 @@ pub fn approver_for(
     }
 }
 
+/// Timeout for a single prompt round-trip (user has this long to click).
+const AGENT_PROMPT_TIMEOUT_SECS: u64 = 300;
+
+/// A live connection to a registered per-user approval agent.
+pub struct AgentHandle {
+    stream: Mutex<UnixStream>,
+}
+
+impl AgentHandle {
+    #[must_use]
+    pub fn new(stream: UnixStream) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+        }
+    }
+
+    /// Send a prompt and wait for a verdict. Serializes concurrent callers.
+    pub fn prompt(&self, p: &Prompt) -> Approval {
+        let mut guard = match self.stream.lock() {
+            Ok(g) => g,
+            Err(e) => return Approval::Error(format!("agent handle poisoned: {e}")),
+        };
+        let line = match p.to_line() {
+            Ok(l) => l,
+            Err(e) => return Approval::Error(format!("failed to serialize prompt: {e}")),
+        };
+        if let Err(e) = guard.write_all(line.as_bytes()) {
+            return Approval::Error(format!("failed to send prompt to agent: {e}"));
+        }
+        if let Err(e) = guard.flush() {
+            return Approval::Error(format!("failed to flush prompt to agent: {e}"));
+        }
+        if let Err(e) =
+            guard.set_read_timeout(Some(Duration::from_secs(AGENT_PROMPT_TIMEOUT_SECS)))
+        {
+            return Approval::Error(format!("set_read_timeout failed: {e}"));
+        }
+        let mut reader = BufReader::new(&*guard);
+        let mut verdict_line = String::new();
+        if let Err(e) = reader.read_line(&mut verdict_line) {
+            return Approval::Error(format!("approval agent timed out or disconnected: {e}"));
+        }
+        if verdict_line.is_empty() {
+            return Approval::Error("approval agent disconnected".into());
+        }
+        match Verdict::from_line(&verdict_line) {
+            Ok(Verdict::Allow) => Approval::Allowed,
+            Ok(Verdict::Deny) => Approval::Denied,
+            Ok(Verdict::Error { why }) => Approval::Error(why),
+            Err(e) => Approval::Error(format!("malformed verdict from agent: {e}")),
+        }
+    }
+}
+
+/// Shared registry: maps uid → live agent connection.
+pub type AgentRegistry = (Mutex<HashMap<u32, Arc<AgentHandle>>>, Condvar);
+
+/// Approver that routes each prompt to the registered per-user agent.
+pub struct AgentApprover {
+    pub registry: Arc<AgentRegistry>,
+    /// How long to wait for an agent to register before returning an error.
+    pub register_wait: Duration,
+}
+
+impl Approver for AgentApprover {
+    fn approve(&self, caller_uid: u32, req: &Request) -> Approval {
+        let (ref lock, ref cv) = *self.registry;
+
+        // Wait up to register_wait for the agent to appear.
+        let deadline = std::time::Instant::now() + self.register_wait;
+        let handle = loop {
+            let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(h) = guard.get(&caller_uid) {
+                break Arc::clone(h);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Approval::Error(
+                    "no approval agent running in your session; is sudix-agent running?".into(),
+                );
+            }
+            let (_guard, timed_out) = cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if timed_out.timed_out() {
+                return Approval::Error(
+                    "no approval agent running in your session; is sudix-agent running?".into(),
+                );
+            }
+        };
+
+        let prompt = Prompt {
+            argv: req.argv.clone(),
+            cwd: req.cwd.clone(),
+            reason: req.reason.clone(),
+        };
+        handle.prompt(&prompt)
+    }
+
+    fn clone_box(&self) -> Box<dyn Approver> {
+        Box::new(Self {
+            registry: Arc::clone(&self.registry),
+            register_wait: self.register_wait,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +463,85 @@ mod tests {
             )),
         };
         assert_eq!(approver.approve(1000, &req()), Approval::Denied); // otp = None
+    }
+
+    // --- AgentApprover tests ---
+
+    fn make_registry() -> Arc<AgentRegistry> {
+        Arc::new((Mutex::new(HashMap::new()), Condvar::new()))
+    }
+
+    fn agent_req() -> Request {
+        Request {
+            argv: vec!["id".into()],
+            cwd: "/".into(),
+            reason: "test".into(),
+            otp: None,
+        }
+    }
+
+    /// Spawn a fake agent thread that reads one Prompt and replies with the given Verdict.
+    fn fake_agent(agent_stream: UnixStream, verdict: Verdict) {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(&agent_stream);
+            let mut line = String::new();
+            drop(reader.read_line(&mut line));
+            let v_line = verdict.to_line().unwrap();
+            let mut w = &agent_stream;
+            drop(w.write_all(v_line.as_bytes()));
+        });
+    }
+
+    #[test]
+    fn agent_approver_allow() {
+        let registry = make_registry();
+        let (broker_side, agent_side) = UnixStream::pair().unwrap();
+        fake_agent(agent_side, Verdict::Allow);
+        {
+            let (ref lock, ref cv) = *registry;
+            lock.lock().unwrap().insert(1000, Arc::new(AgentHandle::new(broker_side)));
+            cv.notify_all();
+        }
+        let approver = AgentApprover { registry, register_wait: Duration::from_millis(50) };
+        assert_eq!(approver.approve(1000, &agent_req()), Approval::Allowed);
+    }
+
+    #[test]
+    fn agent_approver_deny() {
+        let registry = make_registry();
+        let (broker_side, agent_side) = UnixStream::pair().unwrap();
+        fake_agent(agent_side, Verdict::Deny);
+        {
+            let (ref lock, ref cv) = *registry;
+            lock.lock().unwrap().insert(1000, Arc::new(AgentHandle::new(broker_side)));
+            cv.notify_all();
+        }
+        let approver = AgentApprover { registry, register_wait: Duration::from_millis(50) };
+        assert_eq!(approver.approve(1000, &agent_req()), Approval::Denied);
+    }
+
+    #[test]
+    fn agent_approver_error_from_agent() {
+        let registry = make_registry();
+        let (broker_side, agent_side) = UnixStream::pair().unwrap();
+        fake_agent(agent_side, Verdict::Error { why: "no display".into() });
+        {
+            let (ref lock, ref cv) = *registry;
+            lock.lock().unwrap().insert(1000, Arc::new(AgentHandle::new(broker_side)));
+            cv.notify_all();
+        }
+        let approver = AgentApprover { registry, register_wait: Duration::from_millis(50) };
+        assert!(matches!(approver.approve(1000, &agent_req()), Approval::Error(_)));
+    }
+
+    #[test]
+    fn agent_approver_no_agent_returns_error() {
+        let registry = make_registry();
+        let approver = AgentApprover {
+            registry,
+            register_wait: Duration::from_millis(50),
+        };
+        let result = approver.approve(1000, &agent_req());
+        assert!(matches!(result, Approval::Error(_)));
     }
 }
