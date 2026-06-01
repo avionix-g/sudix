@@ -68,6 +68,7 @@ fn req(parts: &[&str]) -> Request {
         argv: parts.iter().map(|s| (*s).to_string()).collect(),
         cwd: ".".into(),
         reason: "integration".into(),
+        otp: None,
     }
 }
 

@@ -65,6 +65,7 @@ mod tests {
             argv: vec!["id".into()],
             cwd: "/".into(),
             reason: "check".into(),
+            otp: None,
         };
 
         record(&log, 1000, &req, "approved").unwrap();

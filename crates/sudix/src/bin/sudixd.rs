@@ -10,30 +10,37 @@
 //!
 //! Subcommands:
 //!   `sudixd default-config`  — print a starter config to stdout and exit 0.
+//!   `sudixd enroll`          — generate a TOTP secret and print the provisioning URI.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sudix::ZenityApprover;
+use sudix::approval::approver_for;
 use sudix::config::{self, FileConfig};
 use sudix::scoping::RuleScope;
 use sudix::server::{Config, serve};
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    if let Some(subcmd) = args.next() {
-        match subcmd.as_str() {
-            "default-config" => {
-                print!("{}", config::default_config_toml());
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("sudixd: unknown subcommand: {other}");
-                eprintln!("usage: sudixd [default-config]");
-                return ExitCode::FAILURE;
-            }
-        }
+    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    if raw_args.first().map(String::as_str) == Some("default-config") {
+        print!("{}", config::default_config_toml());
+        return ExitCode::SUCCESS;
     }
+
+    if raw_args.first().map(String::as_str) == Some("enroll") {
+        let force = raw_args.contains(&"--force".to_string());
+        return cmd_enroll(force);
+    }
+
+    if let Some(other) = raw_args.first()
+        && other != "--"
+    {
+        eprintln!("sudixd: unknown subcommand: {other}");
+        eprintln!("usage: sudixd [default-config | enroll [--force]]");
+        return ExitCode::FAILURE;
+    }
+    raw_args.clear();
 
     let config_path =
         std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
@@ -42,6 +49,18 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sudixd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let approver = match approver_for(
+        &file_cfg.approval.method,
+        file_cfg.approval.totp_secret_path.as_deref(),
+        true,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sudixd: approval setup failed: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -70,11 +89,74 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match serve(&cfg, &ZenityApprover) {
+    match serve(&cfg, approver.as_ref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sudixd: fatal: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_enroll(force: bool) -> ExitCode {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use totp_rs::{Algorithm, TOTP};
+
+    let config_path =
+        std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
+
+    let Some(secret_path) = get_totp_secret_path(&config_path) else {
+        eprintln!("sudixd enroll: config must have approval.totp_secret_path set to a file path");
+        return ExitCode::FAILURE;
+    };
+
+    if !force && std::path::Path::new(&secret_path).exists() {
+        eprintln!("sudixd enroll: {secret_path} already exists; use --force to overwrite");
+        return ExitCode::FAILURE;
+    }
+
+    let secret = totp_rs::Secret::generate_secret();
+    let secret_b32 = secret.to_encoded().to_string();
+    let secret_bytes = secret.to_bytes().unwrap();
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o400)
+        .open(&secret_path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(secret_b32.as_bytes()) {
+                eprintln!("sudixd enroll: write failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(e) => {
+            eprintln!("sudixd enroll: cannot create {secret_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("sudix".to_string()),
+        "sudixd".to_string(),
+    )
+    .unwrap();
+    let uri = totp.get_url();
+    println!("Secret written to: {secret_path}");
+    println!("Provisioning URI (scan with your authenticator app):");
+    println!("{uri}");
+    ExitCode::SUCCESS
+}
+
+fn get_totp_secret_path(config_path: &str) -> Option<String> {
+    let cfg = FileConfig::load(std::path::Path::new(config_path)).ok()?;
+    cfg.approval.totp_secret_path
 }

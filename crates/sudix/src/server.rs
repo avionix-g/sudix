@@ -298,6 +298,7 @@ mod tests {
             argv: parts.iter().map(|s| (*s).to_string()).collect(),
             cwd: ".".into(),
             reason: "test".into(),
+            otp: None,
         }
     }
 
@@ -306,6 +307,7 @@ mod tests {
             argv: parts.iter().map(|s| (*s).to_string()).collect(),
             cwd: cwd.to_string(),
             reason: "test".into(),
+            otp: None,
         }
     }
 

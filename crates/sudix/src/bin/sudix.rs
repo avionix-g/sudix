@@ -15,19 +15,24 @@ use sudix::protocol::{Request, Response};
 
 struct Args {
     reason: String,
+    otp: Option<String>,
     argv: Vec<String>,
 }
 
-/// Parse `[--reason TEXT] [--] CMD ARGS...`. The first non-flag token (or
-/// everything after `--`) begins the command.
+/// Parse `[--reason TEXT] [--otp CODE] [--] CMD ARGS...`. The first non-flag
+/// token (or everything after `--`) begins the command.
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut reason = "no reason given".to_string();
+    let mut otp: Option<String> = None;
     let mut argv = Vec::new();
 
     while let Some(tok) = raw.next() {
         match tok.as_str() {
             "--reason" => {
                 reason = raw.next().ok_or("--reason requires a value")?;
+            }
+            "--otp" => {
+                otp = Some(raw.next().ok_or("--otp requires a value")?);
             }
             "--" => {
                 argv.extend(raw.by_ref());
@@ -47,7 +52,7 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
     if argv.is_empty() {
         return Err("no command given".into());
     }
-    Ok(Args { reason, argv })
+    Ok(Args { reason, otp, argv })
 }
 
 fn run() -> Result<i32, String> {
@@ -62,6 +67,7 @@ fn run() -> Result<i32, String> {
         argv: args.argv,
         cwd,
         reason: args.reason,
+        otp: args.otp,
     };
 
     let mut stream = UnixStream::connect(&socket_path)
@@ -145,5 +151,24 @@ mod tests {
     #[test]
     fn unknown_leading_flag_is_an_error() {
         assert!(args(&["--bogus", "id"]).is_err());
+    }
+
+    #[test]
+    fn otp_flag_before_command() {
+        let a = args(&["--otp", "123456", "--", "id"]).unwrap();
+        assert_eq!(a.otp, Some("123456".to_string()));
+        assert_eq!(a.argv, vec!["id"]);
+    }
+
+    #[test]
+    fn otp_flag_after_double_dash_belongs_to_command() {
+        let a = args(&["--", "myapp", "--otp", "999"]).unwrap();
+        assert_eq!(a.otp, None);
+        assert_eq!(a.argv, vec!["myapp", "--otp", "999"]);
+    }
+
+    #[test]
+    fn otp_missing_required_arg_is_an_error() {
+        assert!(args(&["--otp"]).is_err());
     }
 }
