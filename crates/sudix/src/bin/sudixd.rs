@@ -4,58 +4,47 @@
 //! each request through policy + human approval, executes approved commands as
 //! root, and audits everything.
 //!
-//! Configuration is intentionally hard-coded here for the sketch: the allowed
-//! caller uid comes from `$SUDIX_ALLOWED_UID`, and the policy is the
-//! [`default_policy`] below. A real deployment would load the policy from a
-//! root-owned config file; keeping it in code for now means the allowlist is
-//! reviewed in the same place as everything else.
+//! Configuration is loaded from a root-owned TOML file (default
+//! `/etc/sudix/policy.toml`, override with `$SUDIX_CONFIG`). The daemon
+//! **refuses to start** if the config is missing, unparseable, or invalid.
+//!
+//! Subcommands:
+//!   `sudixd default-config`  — print a starter config to stdout and exit 0.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use sudix::ZenityApprover;
-use sudix::policy::{Policy, Rule};
+use sudix::config::{self, FileConfig};
 use sudix::server::{Config, serve};
 
-/// The starter allowlist. Deliberately tiny — read-mostly, low-blast-radius
-/// commands. Edit and rebuild to extend; the hard denylist below can never be
-/// overridden by an allow rule.
-fn default_policy() -> Policy {
-    let allow = [
-        // Package management (Arch).
-        vec!["pacman", "-S", "**"],
-        vec!["pacman", "-Syu", "**"],
-        // Service inspection/control.
-        vec!["systemctl", "status", "*"],
-        vec!["systemctl", "restart", "*"],
-        // Trivially safe introspection, handy for smoke-testing.
-        vec!["id"],
-    ]
-    .into_iter()
-    .map(|toks| Rule::new(toks).expect("static rule is well-formed"))
-    .collect();
-
-    // Programs whose blast radius is unbounded regardless of args, or that
-    // would let the agent escape the allowlist (a shell, an editor, etc.).
-    let hard_deny = [
-        "sh", "bash", "zsh", "fish", "dd", "mkfs", "fdisk", "parted", "tee", "chmod", "chown",
-        "visudo", "su", "sudo", "env", "vi", "vim", "nano", "python", "perl",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-
-    Policy::new(allow, hard_deny)
-}
-
-fn allowed_uid() -> Result<u32, String> {
-    let raw = std::env::var("SUDIX_ALLOWED_UID")
-        .map_err(|_| "set SUDIX_ALLOWED_UID to the uid permitted to call the broker".to_string())?;
-    raw.parse::<u32>()
-        .map_err(|e| format!("SUDIX_ALLOWED_UID is not a valid uid: {e}"))
-}
-
 fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    if let Some(subcmd) = args.next() {
+        match subcmd.as_str() {
+            "default-config" => {
+                print!("{}", config::default_config_toml());
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("sudixd: unknown subcommand: {other}");
+                eprintln!("usage: sudixd [default-config]");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let config_path =
+        std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
+
+    let file_cfg = match FileConfig::load(std::path::Path::new(&config_path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sudixd: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let allowed_uid = match allowed_uid() {
         Ok(uid) => uid,
         Err(e) => {
@@ -68,7 +57,7 @@ fn main() -> ExitCode {
     let cfg = Config {
         socket_path: PathBuf::from(&runtime_dir).join("sudixd.sock"),
         allowed_uid,
-        policy: default_policy(),
+        policy: file_cfg.build_policy(),
         audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
     };
 
@@ -86,4 +75,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn allowed_uid() -> Result<u32, String> {
+    let raw = std::env::var("SUDIX_ALLOWED_UID")
+        .map_err(|_| "set SUDIX_ALLOWED_UID to the uid permitted to call the broker".to_string())?;
+    raw.parse::<u32>()
+        .map_err(|e| format!("SUDIX_ALLOWED_UID is not a valid uid: {e}"))
 }
