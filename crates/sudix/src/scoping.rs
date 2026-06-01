@@ -122,8 +122,8 @@ pub fn is_rate_limited(
     }
     let now = clock.now();
     let cutoff = now
-        .checked_sub(Duration::from_mins(1))
-        .unwrap_or(Instant::now());
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or(now);
     let mut guard = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -158,6 +158,19 @@ pub fn record_approval(
     }
 
     // Always record in the rate window (even if rate_per_min = 0; harmless).
+    guard.rate.entry(rule_index).or_default().push_back(now);
+}
+
+/// Record a cache-hit execution in the rate-limit window.
+///
+/// `rate_per_min` limits *executions*, not just human approvals. Cache hits
+/// bypass the approver but are still counted so the operator's configured
+/// rate cap applies to all executions uniformly.
+pub fn record_cache_hit(state: &Mutex<ApprovalState>, rule_index: usize, clock: &dyn Clock) {
+    let now = clock.now();
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.rate.entry(rule_index).or_default().push_back(now);
 }
 

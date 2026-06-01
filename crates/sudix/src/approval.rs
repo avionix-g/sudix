@@ -8,8 +8,11 @@
 //! The [`Approver`] trait exists so the server can be driven by a scripted
 //! approver in tests; production uses [`ZenityApprover`] or [`TotpApprover`].
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use totp_rs::{Algorithm, Secret, TOTP};
 
@@ -66,8 +69,12 @@ impl Approver for ZenityApprover {
         // zenity exits 0 for the OK/Allow button, non-zero for Cancel/Deny,
         // window-close, and timeout. We additionally treat a spawn failure
         // (zenity missing, no display) as a denial — fail closed.
+        //
+        // --no-markup: suppress Pango markup interpretation so agent-controlled
+        // reason/cwd fields cannot inject styled or misleading text.
         Command::new("zenity")
             .arg("--question")
+            .arg("--no-markup")
             .arg("--title=sudix: root access requested")
             .arg(format!("--text={}", prompt_text(req)))
             .arg("--ok-label=Allow")
@@ -89,35 +96,47 @@ impl Approver for ZenityApprover {
 
 /// Headless approver: verifies a TOTP code supplied in the request.
 ///
-/// The secret lives in a root-owned `0400` file loaded once at startup.
-/// A wrong code, a missing code, and a spawn failure all fail closed.
+/// The secret lives in a root-owned `0400` or `0600` file loaded once at startup.
+/// A wrong code, a missing code, or a previously-used code all fail closed.
 ///
-/// **Replay note:** TOTP codes are valid for ~30–90 seconds depending on
-/// clock skew. A used-code cache is out of scope for this plan; the
-/// peer-cred + `0600` socket limit the exposure surface.
+/// Each code is accepted at most once: the TOTP counter value (`unix_secs / step`)
+/// is recorded in `used_counters` on first use and rejected on any subsequent
+/// attempt within the same validity window. This prevents an agent from reusing a
+/// human-supplied code to approve multiple distinct commands.
 pub struct TotpApprover {
     totp: TOTP,
+    /// Set of already-consumed TOTP counter values. Shared across all clones
+    /// so replay is detected even if the approver is cloned for separate threads.
+    used_counters: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl TotpApprover {
     /// Load and construct from a secret file.
     ///
-    /// The file must be root-owned and mode `0400` (or at most `0600`). A
-    /// group- or world-readable secret file is refused — the same permission
-    /// model as the policy config.
+    /// The file must be root-owned and mode `0400` or `0600` (no group or world
+    /// bits). A group- or world-readable secret file is refused.
     ///
     /// # Errors
     /// Returns a string describing the problem if the file cannot be read,
     /// has wrong permissions, or the secret cannot be decoded.
     pub fn from_secret_file(path: &Path) -> Result<Self, String> {
-        check_secret_permissions(path).map_err(|e| e.to_string())?;
+        Self::from_secret_file_inner(path, true)
+    }
+
+    fn from_secret_file_inner(path: &Path, enforce_perms: bool) -> Result<Self, String> {
+        if enforce_perms {
+            check_secret_permissions(path).map_err(|e| e.to_string())?;
+        }
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let secret = Secret::Encoded(raw.trim().to_string())
             .to_bytes()
             .map_err(|e| format!("bad TOTP secret: {e:?}"))?;
         let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret, None, "sudix".to_string())
             .map_err(|e| format!("TOTP init error: {e:?}"))?;
-        Ok(Self { totp })
+        Ok(Self {
+            totp,
+            used_counters: Arc::new(Mutex::new(HashSet::new())),
+        })
     }
 }
 
@@ -126,12 +145,30 @@ impl Approver for TotpApprover {
         let Some(code) = req.otp.as_deref() else {
             return false; // No code provided → fail closed.
         };
-        self.totp.check_current(code).unwrap_or(false)
+        if !self.totp.check_current(code).unwrap_or(false) {
+            return false;
+        }
+        // Compute the counter value for the current time step.
+        let step = self.totp.step as u64;
+        let counter = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            / step;
+        // Reject if this counter has already been consumed (replay prevention).
+        let mut used = self
+            .used_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !used.insert(counter) {
+            return false; // Code already used this time step.
+        }
+        true
     }
 
     fn clone_box(&self) -> Box<dyn Approver> {
         Box::new(Self {
             totp: self.totp.clone(),
+            used_counters: Arc::clone(&self.used_counters),
         })
     }
 }
@@ -139,9 +176,11 @@ impl Approver for TotpApprover {
 fn check_secret_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path)?;
-    if meta.mode() & 0o022 != 0 {
+    // Reject any group or world access (read, write, or execute).
+    // The secret must be 0400 or 0600 (owner-only read/write).
+    if meta.mode() & 0o077 != 0 {
         return Err(std::io::Error::other(format!(
-            "{} is group- or world-writable; refusing to use as TOTP secret",
+            "{} has group or world permissions; refusing to use as TOTP secret (chmod 0600 or 0400)",
             path.display()
         )));
     }
@@ -173,19 +212,8 @@ pub fn approver_for(
             let path_str = totp_secret_path
                 .ok_or_else(|| "TOTP method requires totp_secret_path".to_string())?;
             let path = Path::new(path_str);
-            if enforce_perms {
-                TotpApprover::from_secret_file(path)
-                    .map(|a| Box::new(a) as Box<dyn Approver + Send + Sync>)
-            } else {
-                // Test path: load secret without perm enforcement.
-                let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                let secret = Secret::Encoded(raw.trim().to_string())
-                    .to_bytes()
-                    .map_err(|e| format!("bad TOTP secret: {e:?}"))?;
-                let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret, None, "sudix".to_string())
-                    .map_err(|e| format!("TOTP init error: {e:?}"))?;
-                Ok(Box::new(TotpApprover { totp }))
-            }
+            TotpApprover::from_secret_file_inner(path, enforce_perms)
+                .map(|a| Box::new(a) as Box<dyn Approver + Send + Sync>)
         }
     }
 }
@@ -246,6 +274,7 @@ mod tests {
 
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let req = Request {
             argv: vec!["id".into()],
@@ -257,10 +286,36 @@ mod tests {
     }
 
     #[test]
+    fn totp_approver_rejects_replay_of_used_code() {
+        let secret_bytes = Secret::Encoded(TEST_SECRET.to_string()).to_bytes().unwrap();
+        let totp = make_totp(&secret_bytes);
+        let code = totp.generate_current().unwrap();
+        let approver = TotpApprover {
+            totp: make_totp(&secret_bytes),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        let req = Request {
+            argv: vec!["id".into()],
+            cwd: "/".into(),
+            reason: "test".into(),
+            otp: Some(code.clone()),
+        };
+        assert!(approver.approve(&req), "first use must succeed");
+        let req2 = Request {
+            argv: vec!["whoami".into()],
+            cwd: "/".into(),
+            reason: "test".into(),
+            otp: Some(code),
+        };
+        assert!(!approver.approve(&req2), "replay must be rejected");
+    }
+
+    #[test]
     fn totp_approver_rejects_wrong_code() {
         let secret_bytes = Secret::Encoded(TEST_SECRET.to_string()).to_bytes().unwrap();
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let req = Request {
             argv: vec!["id".into()],
@@ -276,6 +331,7 @@ mod tests {
         let secret_bytes = Secret::Encoded(TEST_SECRET.to_string()).to_bytes().unwrap();
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         assert!(!approver.approve(&req())); // otp = None
     }

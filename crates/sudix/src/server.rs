@@ -1,7 +1,7 @@
 //! The broker daemon: socket loop, peer-credential auth, and the
 //! policy → approval → execute → audit pipeline.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,16 +11,22 @@ use std::sync::{Arc, Condvar, Mutex};
 /// slot is free. Guards against resource exhaustion at the daemon's expected
 /// low-volume use.
 const MAX_CONCURRENT: usize = 16;
+/// Maximum bytes read from the request socket before treating the line as
+/// malformed. argv + cwd + reason + OTP is never close to 64 KiB.
+const MAX_REQUEST_BYTES: u64 = 65_536;
+/// Maximum bytes for the agent-supplied reason field.
+const MAX_REASON_BYTES: usize = 512;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
 use crate::approval::Approver;
-use crate::audit;
+use crate::audit::{self, Outcome};
 use crate::policy::{Policy, Verdict};
 use crate::protocol::{Request, Response};
 use crate::scoping::{self, ApprovalState, Clock, RealClock, RuleScope};
 
 /// Runtime configuration for the daemon.
+#[derive(Clone)]
 pub struct Config {
     /// Where the listening unix socket lives.
     pub socket_path: PathBuf,
@@ -35,22 +41,13 @@ pub struct Config {
     pub audit_path: PathBuf,
 }
 
-impl Config {
-    /// Produce a thread-shareable clone. `Config` is plain data.
-    fn clone_for_thread(&self) -> Self {
-        Self {
-            socket_path: self.socket_path.clone(),
-            agent_uids: self.agent_uids.clone(),
-            policy: self.policy.clone(),
-            rule_scopes: self.rule_scopes.clone(),
-            audit_path: self.audit_path.clone(),
-        }
-    }
-}
-
 /// Decide and (if approved) execute a request. This is the heart of the broker,
 /// kept free of any socket concerns so it can be unit-tested with a fake
 /// [`Approver`].
+///
+/// `approval_mutex` serializes the blocking human-approval step so at most one
+/// dialog is outstanding at a time. Pass `None` only in tests (a fresh
+/// `Mutex::new(())` inside the call is equivalent and cheap).
 ///
 /// Pipeline, fail-closed at every step:
 /// 1. policy check (deny-by-default) — denied requests never reach the human;
@@ -62,19 +59,28 @@ pub fn handle_request(
     caller_uid: u32,
     approver: &dyn Approver,
     approval_state: &Mutex<ApprovalState>,
+    approval_mutex: Option<&Mutex<()>>,
     clock: &dyn Clock,
     req: &Request,
 ) -> Response {
     if req.argv.is_empty() {
-        audit_best_effort(cfg, caller_uid, req, "denied-empty");
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedEmpty);
         return Response::Denied {
             why: "empty argv".into(),
         };
     }
 
+    // Bound agent-controlled free-text fields to prevent dialog abuse.
+    if req.reason.len() > MAX_REASON_BYTES {
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedEmpty);
+        return Response::Denied {
+            why: "reason field too long".into(),
+        };
+    }
+
     let rule_index = match cfg.policy.evaluate(&req.argv) {
         Verdict::Denied { reason } => {
-            audit_best_effort(cfg, caller_uid, req, "denied-policy");
+            audit_best_effort(cfg, caller_uid, req, Outcome::DeniedPolicy);
             return Response::Denied { why: reason };
         }
         Verdict::Allowed { rule_index } => rule_index,
@@ -83,13 +89,13 @@ pub fn handle_request(
     // Validate and canonicalize cwd before showing it to the human or using it
     // in exec — the client supplies this value and it must not be trusted raw.
     let Ok(cwd) = std::fs::canonicalize(&req.cwd) else {
-        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedCwd);
         return Response::Denied {
             why: "invalid working directory".into(),
         };
     };
     if !cwd.is_dir() {
-        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedCwd);
         return Response::Denied {
             why: "invalid working directory".into(),
         };
@@ -97,7 +103,7 @@ pub fn handle_request(
 
     // Rate limiting: checked before prompting.
     if scoping::is_rate_limited(approval_state, &cfg.rule_scopes, rule_index, clock) {
-        audit_best_effort(cfg, caller_uid, req, "denied-rate");
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedRate);
         return Response::Denied {
             why: "rate limit exceeded".into(),
         };
@@ -111,27 +117,50 @@ pub fn handle_request(
         &req.argv,
         clock,
     ) {
-        scoping::CacheVerdict::Hit => match execute(req, &cwd) {
-            Ok((exit_code, stdout, stderr)) => {
-                audit_best_effort(cfg, caller_uid, req, "approved-cached");
-                return Response::Approved {
-                    exit_code,
-                    stdout,
-                    stderr,
-                };
+        scoping::CacheVerdict::Hit => {
+            // Record the cached execution in the rate window too.
+            scoping::record_cache_hit(approval_state, rule_index, clock);
+            match execute(req, &cwd) {
+                Ok((exit_code, stdout, stderr)) => {
+                    audit_best_effort(cfg, caller_uid, req, Outcome::ApprovedCached { exit_code });
+                    return Response::Approved {
+                        exit_code,
+                        stdout,
+                        stderr,
+                    };
+                }
+                Err(e) => {
+                    audit_best_effort(cfg, caller_uid, req, Outcome::ExecuteError);
+                    return Response::Denied {
+                        why: format!("execution failed: {e}"),
+                    };
+                }
             }
-            Err(e) => {
-                audit_best_effort(cfg, caller_uid, req, "execute-error");
-                return Response::Denied {
-                    why: format!("execution failed: {e}"),
-                };
-            }
-        },
+        }
         scoping::CacheVerdict::Miss => {}
     }
 
-    if !approver.approve(req) {
-        audit_best_effort(cfg, caller_uid, req, "denied-user");
+    // Serialize the human-facing approval step. Cache misses reach here.
+    // The lock is held only across the blocking approver call; never across I/O
+    // or state-mutex operations (lock-ordering: approval_mutex, then state_mutex
+    // separately — never hold both at once).
+    let _local_mutex;
+    let gate: &Mutex<()> = match approval_mutex {
+        Some(m) => m,
+        None => {
+            _local_mutex = Mutex::new(());
+            &_local_mutex
+        }
+    };
+    let human_approved = {
+        let _guard = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        approver.approve(req)
+    };
+
+    if !human_approved {
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedUser);
         return Response::Denied {
             why: "denied by user".into(),
         };
@@ -148,7 +177,7 @@ pub fn handle_request(
 
     match execute(req, &cwd) {
         Ok((exit_code, stdout, stderr)) => {
-            audit_best_effort(cfg, caller_uid, req, "executed");
+            audit_best_effort(cfg, caller_uid, req, Outcome::Executed { exit_code });
             Response::Approved {
                 exit_code,
                 stdout,
@@ -156,7 +185,7 @@ pub fn handle_request(
             }
         }
         Err(e) => {
-            audit_best_effort(cfg, caller_uid, req, "execute-error");
+            audit_best_effort(cfg, caller_uid, req, Outcome::ExecuteError);
             Response::Denied {
                 why: format!("execution failed: {e}"),
             }
@@ -180,7 +209,7 @@ fn execute(req: &Request, cwd: &Path) -> io::Result<(i32, String, String)> {
     ))
 }
 
-fn audit_best_effort(cfg: &Config, caller_uid: u32, req: &Request, outcome: &str) {
+fn audit_best_effort(cfg: &Config, caller_uid: u32, req: &Request, outcome: Outcome) {
     if let Err(e) = audit::record(&cfg.audit_path, caller_uid, req, outcome) {
         eprintln!("sudixd: audit write failed: {e}");
     }
@@ -221,7 +250,7 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
 /// Returns an error only if `listener.incoming()` itself fails unrecoverably
 /// (in practice this means the listener was already closed).
 pub fn serve_on(listener: &UnixListener, cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
-    let cfg = Arc::new(cfg.clone_for_thread());
+    let cfg = Arc::new(cfg.clone());
     let approver: Arc<dyn Approver> = Arc::from(approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
     // Serializes the blocking human-approval step so only one dialog shows at a time.
@@ -302,20 +331,32 @@ fn handle_connection_threaded(
         return write_response(stream, &resp);
     }
 
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    if reader
+        .take(MAX_REQUEST_BYTES)
+        .read_line(&mut line)?
+        == 0
+    {
         return Ok(());
+    }
+    // A full read that consumed every byte of the cap without a newline means
+    // the line was truncated — treat as malformed rather than buffer more.
+    if line.len() as u64 >= MAX_REQUEST_BYTES && !line.ends_with('\n') {
+        let resp = Response::Denied {
+            why: "request too large".into(),
+        };
+        return write_response(stream, &resp);
     }
 
     let clock = RealClock;
     let resp = match Request::from_line(&line) {
-        Ok(req) => handle_request_with_approval_lock(
+        Ok(req) => handle_request(
             cfg,
             caller_uid,
             approver,
             state,
-            approval_mutex,
+            Some(approval_mutex),
             &clock,
             &req,
         ),
@@ -326,110 +367,7 @@ fn handle_connection_threaded(
     write_response(stream, &resp)
 }
 
-/// Like `handle_request` but holds the approval mutex across the blocking
-/// approver call, serializing human dialogs without holding it over I/O or
-/// short cache/rate checks.
-fn handle_request_with_approval_lock(
-    cfg: &Config,
-    caller_uid: u32,
-    approver: &dyn Approver,
-    state: &Mutex<ApprovalState>,
-    approval_mutex: &Mutex<()>,
-    clock: &dyn Clock,
-    req: &Request,
-) -> Response {
-    if req.argv.is_empty() {
-        audit_best_effort(cfg, caller_uid, req, "denied-empty");
-        return Response::Denied {
-            why: "empty argv".into(),
-        };
-    }
 
-    let rule_index = match cfg.policy.evaluate(&req.argv) {
-        Verdict::Denied { reason } => {
-            audit_best_effort(cfg, caller_uid, req, "denied-policy");
-            return Response::Denied { why: reason };
-        }
-        Verdict::Allowed { rule_index } => rule_index,
-    };
-
-    let Ok(cwd) = std::fs::canonicalize(&req.cwd) else {
-        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
-        return Response::Denied {
-            why: "invalid working directory".into(),
-        };
-    };
-    if !cwd.is_dir() {
-        audit_best_effort(cfg, caller_uid, req, "denied-cwd");
-        return Response::Denied {
-            why: "invalid working directory".into(),
-        };
-    }
-
-    if scoping::is_rate_limited(state, &cfg.rule_scopes, rule_index, clock) {
-        audit_best_effort(cfg, caller_uid, req, "denied-rate");
-        return Response::Denied {
-            why: "rate limit exceeded".into(),
-        };
-    }
-
-    match scoping::check_cache(state, &cfg.rule_scopes, rule_index, &req.argv, clock) {
-        scoping::CacheVerdict::Hit => match execute(req, &cwd) {
-            Ok((exit_code, stdout, stderr)) => {
-                audit_best_effort(cfg, caller_uid, req, "approved-cached");
-                return Response::Approved {
-                    exit_code,
-                    stdout,
-                    stderr,
-                };
-            }
-            Err(e) => {
-                audit_best_effort(cfg, caller_uid, req, "execute-error");
-                return Response::Denied {
-                    why: format!("execution failed: {e}"),
-                };
-            }
-        },
-        scoping::CacheVerdict::Miss => {}
-    }
-
-    // Serialize the human-facing approval step. Cache misses reach here.
-    // The lock is held only across the blocking approver call; never across I/O
-    // or state-mutex operations (lock-ordering: approval_mutex, then state_mutex
-    // separately — never hold both at once).
-    let human_approved = {
-        let _guard = approval_mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        approver.approve(req)
-    };
-
-    if !human_approved {
-        audit_best_effort(cfg, caller_uid, req, "denied-user");
-        return Response::Denied {
-            why: "denied by user".into(),
-        };
-    }
-
-    scoping::record_approval(state, &cfg.rule_scopes, rule_index, &req.argv, clock);
-
-    match execute(req, &cwd) {
-        Ok((exit_code, stdout, stderr)) => {
-            audit_best_effort(cfg, caller_uid, req, "executed");
-            Response::Approved {
-                exit_code,
-                stdout,
-                stderr,
-            }
-        }
-        Err(e) => {
-            audit_best_effort(cfg, caller_uid, req, "execute-error");
-            Response::Denied {
-                why: format!("execution failed: {e}"),
-            }
-        }
-    }
-}
 
 /// Authenticate the connecting process by kernel-vouched credentials. The uid
 /// here is supplied by the kernel via `SO_PEERCRED`, not by the peer, so it
@@ -522,6 +460,7 @@ mod tests {
             1000,
             &approver,
             &state,
+            None,
             &RealClock,
             &req_with_cwd(&["echo", "hi"], "/no/such/directory/ever"),
         );
@@ -550,6 +489,7 @@ mod tests {
             1000,
             &approver,
             &state,
+            None,
             &RealClock,
             &req_with_cwd(&["echo", "hi"], file_path.to_str().unwrap()),
         );
@@ -575,6 +515,7 @@ mod tests {
             1000,
             &approver,
             &state,
+            None,
             &RealClock,
             &req(&["rm", "-rf", "/"]),
         );
@@ -597,6 +538,7 @@ mod tests {
             1000,
             &approver,
             &state,
+            None,
             &RealClock,
             &req(&["echo", "hi"]),
         );
@@ -618,6 +560,7 @@ mod tests {
             1000,
             &approver,
             &state,
+            None,
             &RealClock,
             &req(&["echo", "hello"]),
         );
@@ -641,8 +584,8 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
-        handle_request(&cfg, 1000, &yes, &state, &RealClock, &req(&["echo", "ok"]));
-        handle_request(&cfg, 1000, &yes, &state, &RealClock, &req(&["dd", "x"])); // policy-denied
+        handle_request(&cfg, 1000, &yes, &state, None, &RealClock, &req(&["echo", "ok"]));
+        handle_request(&cfg, 1000, &yes, &state, None, &RealClock, &req(&["dd", "x"])); // policy-denied
         let body = std::fs::read_to_string(&cfg.audit_path).unwrap();
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("executed"));
