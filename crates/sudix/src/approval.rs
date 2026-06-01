@@ -61,17 +61,28 @@ pub fn prompt_text(p: &Prompt) -> String {
 /// markup into the dialog text.
 #[must_use]
 pub fn spawn_zenity(p: &Prompt) -> Verdict {
-    match Command::new("zenity")
-        .arg("--question")
-        .arg("--no-markup")
-        .arg("--title=sudix: root access requested")
-        .arg(format!("--text={}", prompt_text(p)))
-        .arg("--ok-label=Allow")
-        .arg("--cancel-label=Deny")
-        .arg("--default-cancel")
-        .arg("--width=500")
-        .status()
-    {
+    verdict_from_status(
+        Command::new("zenity")
+            .arg("--question")
+            .arg("--no-markup")
+            .arg("--title=sudix: root access requested")
+            .arg(format!("--text={}", prompt_text(p)))
+            .arg("--ok-label=Allow")
+            .arg("--cancel-label=Deny")
+            .arg("--default-cancel")
+            .arg("--width=500")
+            .status(),
+    )
+}
+
+/// Map a zenity spawn result to a [`Verdict`]. Split from [`spawn_zenity`] so
+/// the exit-status mapping can be unit-tested without spawning a real dialog.
+///
+/// zenity exits 0 for OK/Allow, non-zero for Cancel/Deny, window-close, and
+/// timeout. A spawn failure (e.g. no display, zenity missing) is an error, not
+/// a denial.
+fn verdict_from_status(result: std::io::Result<std::process::ExitStatus>) -> Verdict {
+    match result {
         Ok(s) if s.success() => Verdict::Allow,
         Ok(_) => Verdict::Deny,
         Err(e) => Verdict::Error {
@@ -414,6 +425,30 @@ mod tests {
             "plain".to_string(),
         ]);
         assert_eq!(joined, r#"echo "hello world" plain"#);
+    }
+
+    fn exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn zenity_exit_zero_maps_to_allow() {
+        assert_eq!(verdict_from_status(Ok(exit(0))), Verdict::Allow);
+    }
+
+    #[test]
+    fn zenity_exit_nonzero_maps_to_deny() {
+        assert_eq!(verdict_from_status(Ok(exit(1))), Verdict::Deny);
+    }
+
+    #[test]
+    fn zenity_spawn_failure_maps_to_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "zenity not found");
+        assert!(matches!(
+            verdict_from_status(Err(err)),
+            Verdict::Error { .. }
+        ));
     }
 
     fn make_totp(secret_bytes: &[u8]) -> TOTP {

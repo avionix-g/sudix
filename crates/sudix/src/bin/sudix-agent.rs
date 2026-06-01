@@ -86,6 +86,3 @@ fn main() -> ExitCode {
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
-
-#[cfg(test)]
-mod tests {}
