@@ -58,7 +58,8 @@ pub fn prompt_text(req: &Request) -> String {
 /// Join argv into a display string. This is for *human display only* — it is
 /// never parsed back or fed to a shell, so simple quoting of whitespace-bearing
 /// tokens is sufficient to keep the dialog unambiguous.
-fn shell_join(argv: &[String]) -> String {
+#[must_use]
+pub fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
             if a.is_empty() || a.contains(char::is_whitespace) {
