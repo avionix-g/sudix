@@ -18,6 +18,7 @@ use crate::protocol::Request;
 ///
 /// Exhaustive list of tags written to the audit log:
 /// - `denied-empty` — argv was empty
+/// - `denied-reason` — reason field was too long
 /// - `denied-policy` — policy refused the command
 /// - `denied-cwd` — cwd was invalid or non-existent
 /// - `denied-rate` — rate limit exceeded
@@ -28,6 +29,7 @@ use crate::protocol::Request;
 #[derive(Debug, Clone, Copy)]
 pub enum Outcome {
     DeniedEmpty,
+    DeniedReason,
     DeniedPolicy,
     DeniedCwd,
     DeniedRate,
@@ -41,6 +43,7 @@ impl Outcome {
     fn as_tag_and_exit(self) -> (&'static str, Option<i32>) {
         match self {
             Outcome::DeniedEmpty => ("denied-empty", None),
+            Outcome::DeniedReason => ("denied-reason", None),
             Outcome::DeniedPolicy => ("denied-policy", None),
             Outcome::DeniedCwd => ("denied-cwd", None),
             Outcome::DeniedRate => ("denied-rate", None),
@@ -70,12 +73,7 @@ struct Entry<'a> {
 ///
 /// # Errors
 /// Returns any I/O error from opening or writing the log file.
-pub fn record(
-    log_path: &Path,
-    caller_uid: u32,
-    req: &Request,
-    outcome: Outcome,
-) -> io::Result<()> {
+pub fn record(log_path: &Path, caller_uid: u32, req: &Request, outcome: Outcome) -> io::Result<()> {
     let (tag, exit_code) = outcome.as_tag_and_exit();
     let entry = Entry {
         unix_secs: SystemTime::now()

@@ -54,6 +54,7 @@ pub struct Config {
 /// 2. human approval (out-of-band) — a non-affirmative answer denies;
 /// 3. execution as the daemon's own (root) identity;
 /// 4. audit, regardless of outcome.
+#[allow(clippy::too_many_lines)]
 pub fn handle_request(
     cfg: &Config,
     caller_uid: u32,
@@ -72,7 +73,7 @@ pub fn handle_request(
 
     // Bound agent-controlled free-text fields to prevent dialog abuse.
     if req.reason.len() > MAX_REASON_BYTES {
-        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedEmpty);
+        audit_best_effort(cfg, caller_uid, req, Outcome::DeniedReason);
         return Response::Denied {
             why: "reason field too long".into(),
         };
@@ -144,13 +145,12 @@ pub fn handle_request(
     // The lock is held only across the blocking approver call; never across I/O
     // or state-mutex operations (lock-ordering: approval_mutex, then state_mutex
     // separately — never hold both at once).
-    let _local_mutex;
-    let gate: &Mutex<()> = match approval_mutex {
-        Some(m) => m,
-        None => {
-            _local_mutex = Mutex::new(());
-            &_local_mutex
-        }
+    let local_mutex;
+    let gate: &Mutex<()> = if let Some(m) = approval_mutex {
+        m
+    } else {
+        local_mutex = Mutex::new(());
+        &local_mutex
     };
     let human_approved = {
         let _guard = gate
@@ -333,11 +333,7 @@ fn handle_connection_threaded(
 
     let reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    if reader
-        .take(MAX_REQUEST_BYTES)
-        .read_line(&mut line)?
-        == 0
-    {
+    if reader.take(MAX_REQUEST_BYTES).read_line(&mut line)? == 0 {
         return Ok(());
     }
     // A full read that consumed every byte of the cap without a newline means
@@ -366,8 +362,6 @@ fn handle_connection_threaded(
     };
     write_response(stream, &resp)
 }
-
-
 
 /// Authenticate the connecting process by kernel-vouched credentials. The uid
 /// here is supplied by the kernel via `SO_PEERCRED`, not by the peer, so it
@@ -584,8 +578,24 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
-        handle_request(&cfg, 1000, &yes, &state, None, &RealClock, &req(&["echo", "ok"]));
-        handle_request(&cfg, 1000, &yes, &state, None, &RealClock, &req(&["dd", "x"])); // policy-denied
+        handle_request(
+            &cfg,
+            1000,
+            &yes,
+            &state,
+            None,
+            &RealClock,
+            &req(&["echo", "ok"]),
+        );
+        handle_request(
+            &cfg,
+            1000,
+            &yes,
+            &state,
+            None,
+            &RealClock,
+            &req(&["dd", "x"]),
+        ); // policy-denied
         let body = std::fs::read_to_string(&cfg.audit_path).unwrap();
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("executed"));

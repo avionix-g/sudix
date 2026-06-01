@@ -149,7 +149,7 @@ impl Approver for TotpApprover {
             return false;
         }
         // Compute the counter value for the current time step.
-        let step = self.totp.step as u64;
+        let step = self.totp.step;
         let counter = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
@@ -274,7 +274,9 @@ mod tests {
 
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
-            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         };
         let req = Request {
             argv: vec!["id".into()],
@@ -292,7 +294,9 @@ mod tests {
         let code = totp.generate_current().unwrap();
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
-            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         };
         let req = Request {
             argv: vec!["id".into()],
@@ -315,7 +319,9 @@ mod tests {
         let secret_bytes = Secret::Encoded(TEST_SECRET.to_string()).to_bytes().unwrap();
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
-            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         };
         let req = Request {
             argv: vec!["id".into()],
@@ -331,7 +337,9 @@ mod tests {
         let secret_bytes = Secret::Encoded(TEST_SECRET.to_string()).to_bytes().unwrap();
         let approver = TotpApprover {
             totp: make_totp(&secret_bytes),
-            used_counters: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            used_counters: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         };
         assert!(!approver.approve(&req())); // otp = None
     }

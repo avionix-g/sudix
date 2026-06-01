@@ -202,3 +202,40 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
         "approval was not serialized"
     );
 }
+
+#[test]
+fn oversized_request_is_refused_not_buffered() {
+    let uid = nix::unistd::getuid().as_raw();
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("sock");
+
+    let cfg = Config {
+        socket_path: socket_path.clone(),
+        agent_uids: vec![uid],
+        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
+        rule_scopes: vec![],
+        audit_path: dir.path().join("audit.log"),
+    };
+    thread::spawn(move || {
+        drop(serve(&cfg, &AlwaysAllow));
+    });
+    wait_for_socket(&socket_path);
+
+    // Write 1 MiB of 'x' with no newline — must be denied, not buffered.
+    // The daemon may close the write end after hitting the cap, so broken-pipe
+    // errors on our side are expected and harmless.
+    let mut stream = UnixStream::connect(&socket_path).expect("connect");
+    let payload = vec![b'x'; 1024 * 1024];
+    drop(stream.write_all(&payload));
+    drop(stream.flush());
+    drop(stream.shutdown(std::net::Shutdown::Write));
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let resp = Response::from_line(&line).expect("valid response");
+    assert!(
+        matches!(resp, Response::Denied { ref why } if why.contains("too large")),
+        "expected 'too large' denial, got: {resp:?}"
+    );
+}

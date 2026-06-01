@@ -121,9 +121,7 @@ pub fn is_rate_limited(
         return false;
     }
     let now = clock.now();
-    let cutoff = now
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or(now);
+    let cutoff = now.checked_sub(Duration::from_mins(1)).unwrap_or(now);
     let mut guard = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -323,5 +321,28 @@ mod tests {
             record_approval(&state, &scopes, 0, &argv(&["id"]), &clock);
         }
         assert!(!is_rate_limited(&state, &scopes, 0, &clock));
+    }
+
+    #[test]
+    fn cache_hits_count_toward_rate_limit() {
+        // TTL > 0 so the cache stays warm; rate = 1 so the second execution is over limit.
+        let state = Mutex::new(ApprovalState::new());
+        let scopes = scopes(60, 1);
+        let (clock, _offset) = FakeClock::new();
+        let args = argv(&["pacman", "-S", "rg"]);
+
+        // Fresh approval: records in both cache and rate window.
+        assert!(!is_rate_limited(&state, &scopes, 0, &clock));
+        record_approval(&state, &scopes, 0, &args, &clock);
+
+        // First cache hit: should consume rate budget.
+        assert!(matches!(
+            check_cache(&state, &scopes, 0, &args, &clock),
+            CacheVerdict::Hit
+        ));
+        record_cache_hit(&state, 0, &clock);
+
+        // Second cache hit: rate budget exhausted — must be rate-limited now.
+        assert!(is_rate_limited(&state, &scopes, 0, &clock));
     }
 }
