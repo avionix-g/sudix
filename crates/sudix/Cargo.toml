@@ -6,16 +6,6 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[dependencies]
-nix.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-
-[dev-dependencies]
-assert_cmd.workspace = true
-predicates.workspace = true
-tempfile.workspace = true
-
 [[bin]]
 name = "sudixd"
 path = "src/bin/sudixd.rs"
@@ -23,6 +13,19 @@ path = "src/bin/sudixd.rs"
 [[bin]]
 name = "sudix"
 path = "src/bin/sudix.rs"
+
+[dependencies]
+listenfd.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+totp-rs.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

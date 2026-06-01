@@ -1,0 +1,21 @@
+[Unit]
+Description=sudix privileged-action broker
+Documentation=https://github.com/avionix/sudix
+After=network.target
+Requires=sudixd.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sudixd
+User=root
+
+# sudixd's whole job is to run arbitrary allowlisted commands as root, so
+# aggressive sandboxing directives that constrain child processes are
+# deliberately omitted. Only options that do not restrict the executed
+# children are set below.
+RuntimeDirectory=sudix
+RuntimeDirectoryMode=0700
+# Keep policy config path accessible (no PrivateTmp — policy lives in /etc).
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,9 @@ pub struct Request {
     pub cwd: String,
     /// Human-readable justification, surfaced in the approval dialog.
     pub reason: String,
+    /// TOTP code for headless approval. Never audited (it is a live secret).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otp: Option<String>,
 }
 
 /// The broker's verdict and (if it ran) the command's result.
@@ -89,6 +92,7 @@ mod tests {
             argv: vec!["pacman".into(), "-S".into(), "ripgrep".into()],
             cwd: "/home/adam/repos/hexapod".into(),
             reason: "install ripgrep".into(),
+            otp: None,
         };
         let line = req.to_line().unwrap();
         assert!(line.ends_with('\n'));
@@ -116,5 +120,37 @@ mod tests {
     fn from_line_tolerates_missing_trailing_newline() {
         let raw = r#"{"argv":["id"],"cwd":"/","reason":"x"}"#;
         assert_eq!(Request::from_line(raw).unwrap().argv, vec!["id"]);
+    }
+
+    #[test]
+    fn request_with_otp_round_trips() {
+        let req = Request {
+            argv: vec!["id".into()],
+            cwd: "/".into(),
+            reason: "totp test".into(),
+            otp: Some("123456".into()),
+        };
+        let line = req.to_line().unwrap();
+        assert!(line.contains("\"otp\""));
+        assert_eq!(Request::from_line(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn old_request_without_otp_deserializes_as_none() {
+        let raw = r#"{"argv":["id"],"cwd":"/","reason":"x"}"#;
+        let req = Request::from_line(raw).unwrap();
+        assert_eq!(req.otp, None);
+    }
+
+    #[test]
+    fn otp_none_is_not_serialized() {
+        let req = Request {
+            argv: vec!["id".into()],
+            cwd: "/".into(),
+            reason: "x".into(),
+            otp: None,
+        };
+        let line = req.to_line().unwrap();
+        assert!(!line.contains("otp"));
     }
 }

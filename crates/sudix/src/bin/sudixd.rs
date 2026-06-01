@@ -4,86 +4,178 @@
 //! each request through policy + human approval, executes approved commands as
 //! root, and audits everything.
 //!
-//! Configuration is intentionally hard-coded here for the sketch: the allowed
-//! caller uid comes from `$SUDIX_ALLOWED_UID`, and the policy is the
-//! [`default_policy`] below. A real deployment would load the policy from a
-//! root-owned config file; keeping it in code for now means the allowlist is
-//! reviewed in the same place as everything else.
+//! Configuration is loaded from a root-owned TOML file (default
+//! `/etc/sudix/policy.toml`, override with `$SUDIX_CONFIG`). The daemon
+//! **refuses to start** if the config is missing, unparseable, or invalid.
+//!
+//! Subcommands:
+//!   `sudixd default-config`  — print a starter config to stdout and exit 0.
+//!   `sudixd enroll`          — generate a TOTP secret and print the provisioning URI.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sudix::ZenityApprover;
-use sudix::policy::{Policy, Rule};
-use sudix::server::{Config, serve};
+use listenfd::ListenFd;
 
-/// The starter allowlist. Deliberately tiny — read-mostly, low-blast-radius
-/// commands. Edit and rebuild to extend; the hard denylist below can never be
-/// overridden by an allow rule.
-fn default_policy() -> Policy {
-    let allow = [
-        // Package management (Arch).
-        vec!["pacman", "-S", "**"],
-        vec!["pacman", "-Syu", "**"],
-        // Service inspection/control.
-        vec!["systemctl", "status", "*"],
-        vec!["systemctl", "restart", "*"],
-        // Trivially safe introspection, handy for smoke-testing.
-        vec!["id"],
-    ]
-    .into_iter()
-    .map(|toks| Rule::new(toks).expect("static rule is well-formed"))
-    .collect();
-
-    // Programs whose blast radius is unbounded regardless of args, or that
-    // would let the agent escape the allowlist (a shell, an editor, etc.).
-    let hard_deny = [
-        "sh", "bash", "zsh", "fish", "dd", "mkfs", "fdisk", "parted", "tee", "chmod", "chown",
-        "visudo", "su", "sudo", "env", "vi", "vim", "nano", "python", "perl",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-
-    Policy::new(allow, hard_deny)
-}
-
-fn allowed_uid() -> Result<u32, String> {
-    let raw = std::env::var("SUDIX_ALLOWED_UID")
-        .map_err(|_| "set SUDIX_ALLOWED_UID to the uid permitted to call the broker".to_string())?;
-    raw.parse::<u32>()
-        .map_err(|e| format!("SUDIX_ALLOWED_UID is not a valid uid: {e}"))
-}
+use sudix::approval::approver_for;
+use sudix::config::{self, FileConfig};
+use sudix::scoping::RuleScope;
+use sudix::server::{Config, serve, serve_on};
 
 fn main() -> ExitCode {
-    let allowed_uid = match allowed_uid() {
-        Ok(uid) => uid,
+    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    if raw_args.first().map(String::as_str) == Some("default-config") {
+        print!("{}", config::default_config_toml());
+        return ExitCode::SUCCESS;
+    }
+
+    if raw_args.first().map(String::as_str) == Some("enroll") {
+        let force = raw_args.contains(&"--force".to_string());
+        return cmd_enroll(force);
+    }
+
+    if let Some(other) = raw_args.first()
+        && other != "--"
+    {
+        eprintln!("sudixd: unknown subcommand: {other}");
+        eprintln!("usage: sudixd [default-config | enroll [--force]]");
+        return ExitCode::FAILURE;
+    }
+    raw_args.clear();
+
+    let config_path =
+        std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
+
+    let file_cfg = match FileConfig::load(std::path::Path::new(&config_path)) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("sudixd: {e}");
             return ExitCode::FAILURE;
         }
     };
 
+    let approver = match approver_for(
+        &file_cfg.approval.method,
+        file_cfg.approval.totp_secret_path.as_deref(),
+        true,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sudixd: approval setup failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let runtime_dir = std::env::var("SUDIX_RUNTIME_DIR").unwrap_or_else(|_| "/run/sudix".into());
+    let rule_scopes = file_cfg
+        .rule_scoping()
+        .into_iter()
+        .map(|(ttl, rate)| RuleScope {
+            cache_ttl_secs: ttl,
+            rate_per_min: rate,
+        })
+        .collect();
     let cfg = Config {
         socket_path: PathBuf::from(&runtime_dir).join("sudixd.sock"),
-        allowed_uid,
-        policy: default_policy(),
+        agent_uids: file_cfg.agent_uids.clone(),
+        policy: file_cfg.build_policy(),
+        rule_scopes,
         audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
     };
 
-    if let Some(parent) = cfg.socket_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        eprintln!("sudixd: cannot create {}: {e}", parent.display());
-        return ExitCode::FAILURE;
-    }
+    // Prefer a pre-bound listener from systemd socket activation. If none is
+    // available, bind the socket ourselves (and create the runtime dir first).
+    let result = if let Some(listener) = try_systemd_listener() {
+        eprintln!(
+            "sudixd: using systemd-passed socket (agent uids: {:?})",
+            cfg.agent_uids
+        );
+        serve_on(&listener, &cfg, approver.as_ref())
+    } else {
+        if let Some(parent) = cfg.socket_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("sudixd: cannot create {}: {e}", parent.display());
+            return ExitCode::FAILURE;
+        }
+        serve(&cfg, approver.as_ref())
+    };
 
-    match serve(&cfg, &ZenityApprover) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sudixd: fatal: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Return the first Unix listener handed in by systemd socket activation, if any.
+fn try_systemd_listener() -> Option<std::os::unix::net::UnixListener> {
+    let mut lfd = ListenFd::from_env();
+    lfd.take_unix_listener(0).ok().flatten()
+}
+
+fn cmd_enroll(force: bool) -> ExitCode {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use totp_rs::{Algorithm, TOTP};
+
+    let config_path =
+        std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
+
+    let Some(secret_path) = get_totp_secret_path(&config_path) else {
+        eprintln!("sudixd enroll: config must have approval.totp_secret_path set to a file path");
+        return ExitCode::FAILURE;
+    };
+
+    if !force && std::path::Path::new(&secret_path).exists() {
+        eprintln!("sudixd enroll: {secret_path} already exists; use --force to overwrite");
+        return ExitCode::FAILURE;
+    }
+
+    let secret = totp_rs::Secret::generate_secret();
+    let secret_b32 = secret.to_encoded().to_string();
+    let secret_bytes = secret.to_bytes().unwrap();
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o400)
+        .open(&secret_path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(secret_b32.as_bytes()) {
+                eprintln!("sudixd enroll: write failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(e) => {
+            eprintln!("sudixd enroll: cannot create {secret_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("sudix".to_string()),
+        "sudixd".to_string(),
+    )
+    .unwrap();
+    let uri = totp.get_url();
+    println!("Secret written to: {secret_path}");
+    println!("Provisioning URI (scan with your authenticator app):");
+    println!("{uri}");
+    ExitCode::SUCCESS
+}
+
+fn get_totp_secret_path(config_path: &str) -> Option<String> {
+    let cfg = FileConfig::load(std::path::Path::new(config_path)).ok()?;
+    cfg.approval.totp_secret_path
 }

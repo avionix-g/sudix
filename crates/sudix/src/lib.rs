@@ -17,10 +17,13 @@
 
 pub mod approval;
 pub mod audit;
+pub mod config;
 pub mod policy;
 pub mod protocol;
+pub mod scoping;
 pub mod server;
 
-pub use approval::{Approver, ZenityApprover};
+pub use approval::{Approver, TotpApprover, ZenityApprover, approver_for};
+pub use config::ConfigError;
 pub use policy::{Policy, Rule, Verdict};
 pub use protocol::{Request, Response};
