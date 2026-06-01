@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/sudix"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/avionix/sudix"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+assert_cmd = "2"
+nix = { version = "0.31", features = ["socket", "user", "process"] }
+predicates = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[workspace.lints.clippy]
+cargo = "allow"
+complexity = "deny"
+correctness = "deny"
+missing-errors-doc = { level = "allow", priority = 1 }
+missing-panics-doc = { level = "allow", priority = 1 }
+pedantic = "deny"
+perf = "deny"
+style = "deny"
+suspicious = "deny"
+
+[workspace.lints.rust]
+future-incompatible = "warn"
+keyword-idents = "warn"
+let-underscore = "warn"
+nonstandard_style = "warn"
+refining-impl-trait = "warn"
+unknown-or-malformed-diagnostic-attributes = { level = "deny", priority = 1 }
+unsafe_code = { level = "forbid", priority = 1 }
+unused = "warn"
