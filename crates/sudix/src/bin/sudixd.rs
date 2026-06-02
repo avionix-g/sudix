@@ -19,8 +19,7 @@ use listenfd::ListenFd;
 
 use sudix::approval::{AgentApprover, approver_for};
 use sudix::config::{self, FileConfig};
-use sudix::scoping::RuleScope;
-use sudix::server::{Config, serve, serve_on, serve_on_with_registry, serve_with_registry};
+use sudix::server::{serve, serve_on, serve_on_with_registry, serve_with_registry};
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,12 +53,18 @@ fn main() -> ExitCode {
 
 fn run_daemon() -> std::io::Result<()> {
     use std::io::Error;
+    use std::sync::Arc;
+
+    use sudix::scoping::RuleScope;
+    use sudix::server::{Config, PolicyBundle, ReloadCtx};
 
     let config_path =
         std::env::var("SUDIX_CONFIG").unwrap_or_else(|_| config::DEFAULT_CONFIG_PATH.to_string());
+    let config_path = std::path::PathBuf::from(config_path);
 
-    let file_cfg = FileConfig::load(std::path::Path::new(&config_path))
-        .map_err(|e| Error::other(e.to_string()))?;
+    let file_cfg = FileConfig::load(&config_path).map_err(|e| Error::other(e.to_string()))?;
+
+    let initial_hash = config::config_hash(&config_path).ok();
 
     let static_approver = approver_for(
         &file_cfg.approval.method,
@@ -77,22 +82,33 @@ fn run_daemon() -> std::io::Result<()> {
             rate_per_min: rate,
         })
         .collect();
-    let cfg = Config {
-        socket_path: PathBuf::from(&runtime_dir).join("sudixd.sock"),
-        agent_uids: file_cfg.agent_uids.clone(),
+    let bundle = PolicyBundle {
         policy: file_cfg.build_policy(),
         rule_scopes,
-        audit_path: PathBuf::from(&runtime_dir).join("audit.log"),
+        agent_uids: file_cfg.agent_uids.clone(),
     };
+    let cfg = Arc::new(Config::new(
+        PathBuf::from(&runtime_dir).join("sudixd.sock"),
+        PathBuf::from(&runtime_dir).join("audit.log"),
+        ReloadCtx {
+            config_path,
+            enforce_perms: true,
+        },
+        bundle,
+        initial_hash,
+    ));
 
     if let Some(approver) = static_approver {
         // Static approver (totp): use the standard serve path.
         if let Some(listener) = try_systemd_listener() {
             eprintln!(
                 "sudixd: using systemd-passed socket (agent uids: {:?})",
-                cfg.agent_uids
+                cfg.current
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .agent_uids
             );
-            serve_on(&listener, &cfg, approver.as_ref())
+            serve_on(&cfg, &listener, approver.as_ref())
         } else {
             if let Some(parent) = cfg.socket_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -114,9 +130,12 @@ fn run_daemon() -> std::io::Result<()> {
         if let Some(listener) = try_systemd_listener() {
             eprintln!(
                 "sudixd: using systemd-passed socket (agent uids: {:?})",
-                cfg.agent_uids
+                cfg.current
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .agent_uids
             );
-            serve_on_with_registry(&listener, &cfg, &approver, &registry)
+            serve_on_with_registry(&cfg, &listener, &approver, &registry)
         } else {
             if let Some(parent) = cfg.socket_path.parent() {
                 std::fs::create_dir_all(parent)?;

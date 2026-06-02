@@ -17,7 +17,7 @@ options all hand it more than you want:
 `sudix` does not give the agent a credential. The agent **requests** a specific
 command; a root daemon decides:
 
-1. **Policy** (deny-by-default allowlist + non-overridable hard denylist) —
+1. **Policy** (deny-by-default regex allowlist with an explicit deny list) —
    runs server-side, so the agent can't forge it. Denied requests never reach
    the human.
 2. **Approval** — out-of-band (zenity dialog or TOTP code), showing the *exact*
@@ -47,7 +47,7 @@ agent ──unix socket──▶ sudixd (root)
 | Module      | Responsibility                                                     |
 |-------------|--------------------------------------------------------------------|
 | `protocol`  | Newline-delimited JSON wire types (`Request`, `Response`).         |
-| `policy`    | Allowlist matching (`*` = one arg, `**` = rest). The policy gate.  |
+| `policy`    | Per-token matching (literal / anchored-regex / rest). The policy gate. |
 | `approval`  | `Approver` trait + `ZenityApprover` + `TotpApprover`. Fail-closed. |
 | `scoping`   | Per-rule TTL cache, rate limiting, injectable clock.               |
 | `audit`     | Append-only JSONL log.                                             |
@@ -93,6 +93,33 @@ must be owned by root and not group- or world-writable. Generate a starter:
 sudixd default-config
 ```
 
+The daemon hot-reloads the policy on each incoming request when the file's
+**contents change** (detected by SHA-256) — **no restart required** after
+editing `policy.toml`. If the file fails to load (bad TOML, invalid rule),
+the request is refused and the old in-memory policy is kept until the file is
+fixed. Saving the file with identical content is a no-op (detected by SHA-256);
+any change in content resets the approval cache and rate-limit state.
+
+### Rule format
+
+A rule's `argv` is an ordered list of **token-matchers**, one per shell token:
+
+| Matcher form       | Meaning                                                              |
+|--------------------|----------------------------------------------------------------------|
+| `"token"`          | Exact match for one token (`argv[0]` matched by basename)            |
+| `{ re = "…" }`     | One token matched by an anchored regex — sudix wraps it as `^(?:…)$` |
+| `{ rest = true }`  | Zero or more trailing tokens; valid only as the last element         |
+
+- `argv[0]` is basename-normalized (`/usr/bin/pacman` → `pacman`), so
+  path-spelling can't dodge a rule.
+- Regex patterns are **anchored automatically**. Write `\S+` to match one
+  whitespace-free token; no `^`/`$` needed.
+- A literal `"..."` argument is just `"..."` — no special meaning.
+- **`deny` is evaluated before `allow`.** A command matching any deny rule is
+  refused even if an allow rule would also match it.
+- Arguments containing control characters (newline, tab, NUL, …) are always
+  refused, regardless of rules.
+
 Key fields:
 
 ```toml
@@ -101,16 +128,28 @@ agent_uids = [1000]
 # UIDs whose presence the approval step is meant to prove.
 approver_uids = [1000]
 
-[approval]
-# "zenity" (desktop dialog) or "totp" (headless).
-method = "zenity"
-# totp_secret_path = "/etc/sudix/totp.key"  # required when method = "totp"
+# Deny rules (optional; checked before allow).
+deny = [
+  { argv = [{ re = "sh|bash" }, { rest = true }] },
+]
 
-[[allow]]
-argv = ["pacman", "-S", "**"]
-# cache_ttl_secs = 300  # optional: auto-approve same argv for N seconds
-# rate_per_min   = 10   # optional: max approvals/min (over limit → denied)
+# Allow rules.
+allow = [
+  { argv = ["pacman", "-S", { rest = true }] },
+  { argv = ["systemctl", "status", { re = "\\S+" }] },
+  { argv = ["id"] },
+  # cache_ttl_secs = 300  # optional: auto-approve same argv for N seconds
+  # rate_per_min   = 10   # optional: max approvals/min (over limit → denied)
+]
+
+[approval]
+# "agent" (desktop GUI via sudix-agent) or "totp" (headless).
+method = "agent"
+# totp_secret_path = "/etc/sudix/totp.key"  # required when method = "totp"
 ```
+
+**allow-all:** `argv = [{ rest = true }]` — matches any non-empty argv.
+**program with any args:** `argv = ["prog", { rest = true }]`.
 
 ## Environment variables
 
@@ -125,9 +164,14 @@ argv = ["pacman", "-S", "**"]
 Production-hardened. All items from the initial sketch are now implemented:
 
 - Policy loaded from a root-owned TOML config; `sudixd default-config` prints a starter.
+- Hot-reload: policy changes take effect on the next request (SHA-256 content check); no restart needed.
+  Identical-content saves are no-ops; any content change resets the approval cache and rate state.
+- Per-token rules: literal / anchored-regex / rest; deny takes precedence.
+- Unified `deny`/`allow` rule arrays; deny takes precedence.
 - cwd canonicalized and validated before exec.
 - Per-rule TTL cache, rate limiting, approval caching (server-side; agent can't reach).
-- TOTP headless approval path (`sudixd enroll`); zenity for desktop.
+- TOTP headless approval path (`sudixd enroll`); agent dialog for desktop.
 - Concurrent connections (thread-per-connection + serialized approval gate).
 - systemd unit + socket activation (`dist/systemd/`).
-- Agent vs. approver UID separation; disjoint sets + zenity refused at startup.
+- Agent vs. approver UID separation.
+- `sudix --help` prints usage.

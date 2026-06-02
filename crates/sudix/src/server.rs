@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 /// Maximum concurrent connections. Over this, new connections block until a
 /// slot is free. Guards against resource exhaustion at the daemon's expected
@@ -22,24 +22,136 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
 use crate::approval::{AgentHandle, AgentRegistry, Approval, Approver};
 use crate::audit::{self, Outcome};
+use crate::config::{self, ConfigError, FileConfig};
 use crate::policy::{Policy, Verdict};
 use crate::protocol::{Hello, Request, Response};
 use crate::scoping::{self, ApprovalState, Clock, RealClock, RuleScope};
 
-/// Runtime configuration for the daemon.
+/// The parts of the runtime config that a reload can change.
 #[derive(Clone)]
+pub struct PolicyBundle {
+    pub policy: Policy,
+    pub rule_scopes: Vec<RuleScope>,
+    pub agent_uids: Vec<u32>,
+}
+
+/// Everything needed to reload: the file path + whether to enforce perms.
+pub struct ReloadCtx {
+    pub config_path: PathBuf,
+    /// `false` only in tests (skips root-ownership check).
+    pub enforce_perms: bool,
+}
+
+/// Runtime configuration for the daemon.
 pub struct Config {
     /// Where the listening unix socket lives.
     pub socket_path: PathBuf,
-    /// UIDs permitted to submit requests. A connection from any other uid is
-    /// refused before policy is even consulted.
-    pub agent_uids: Vec<u32>,
-    /// The authorization policy.
-    pub policy: Policy,
-    /// Per-rule scoping (cache TTL and rate limit); indexed parallel to allow rules.
-    pub rule_scopes: Vec<RuleScope>,
     /// Append-only audit log path.
     pub audit_path: PathBuf,
+    /// Reload parameters.
+    pub reload: ReloadCtx,
+    /// Current policy bundle; swapped on successful reload.
+    pub current: RwLock<Arc<PolicyBundle>>,
+    /// SHA-256 of the last-seen config file contents; `None` means "force a
+    /// reload on next request".
+    pub last_hash: Mutex<Option<[u8; 32]>>,
+}
+
+impl Config {
+    /// Construct from a pre-built bundle. `initial_hash` should come from
+    /// `config_hash(&config_path)` captured right after the initial load.
+    #[must_use]
+    pub fn new(
+        socket_path: PathBuf,
+        audit_path: PathBuf,
+        reload: ReloadCtx,
+        bundle: PolicyBundle,
+        initial_hash: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            socket_path,
+            audit_path,
+            reload,
+            current: RwLock::new(Arc::new(bundle)),
+            last_hash: Mutex::new(initial_hash),
+        }
+    }
+}
+
+/// Reload the policy bundle from disk if the file's contents changed since the
+/// last successful load. On success, swaps in the new bundle and resets
+/// approval state (rule indices may have shifted). On failure, leaves the
+/// current bundle intact and returns the error so the caller can fail closed.
+///
+/// Lock ordering: `last_hash` is acquired before `current` and `state` to
+/// prevent deadlock — all callers must follow this order.
+fn maybe_reload(cfg: &Config, state: &Mutex<ApprovalState>) -> Result<(), ConfigError> {
+    // Read hash outside the lock (cheap I/O, no need to serialize).
+    let h = config::config_hash(&cfg.reload.config_path)?;
+
+    // Hold last_hash across the load to single-flight concurrent reloads.
+    // A second thread that blocked here will see *last == Some(h) and fast-path.
+    let mut last = cfg
+        .last_hash
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if *last == Some(h) {
+        return Ok(()); // fast path: contents unchanged
+    }
+
+    match FileConfig::load_with_checks(&cfg.reload.config_path, cfg.reload.enforce_perms) {
+        Ok(fc) => {
+            let bundle = Arc::new(bundle_from_file_cfg(&fc));
+            {
+                let mut current = cfg
+                    .current
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *current = bundle;
+            }
+            {
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = ApprovalState::new();
+            }
+            *last = Some(h);
+            eprintln!(
+                "sudixd: reloaded policy from {}",
+                cfg.reload.config_path.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("sudixd: config reload failed, keeping previous policy: {e}");
+            Err(e)
+        }
+    }
+}
+
+#[must_use]
+pub fn bundle_from_file_cfg(fc: &FileConfig) -> PolicyBundle {
+    let rule_scopes = fc
+        .rule_scoping()
+        .into_iter()
+        .map(|(ttl, rate)| RuleScope {
+            cache_ttl_secs: ttl,
+            rate_per_min: rate,
+        })
+        .collect();
+    PolicyBundle {
+        policy: fc.build_policy(),
+        rule_scopes,
+        agent_uids: fc.agent_uids.clone(),
+    }
+}
+
+/// Per-connection context snapshot passed to [`handle_request`].
+pub struct RequestCtx<'a> {
+    pub cfg: &'a Config,
+    pub bundle: &'a PolicyBundle,
+    pub caller_uid: u32,
 }
 
 /// Decide and (if approved) execute a request. This is the heart of the broker,
@@ -57,14 +169,20 @@ pub struct Config {
 /// 4. audit, regardless of outcome.
 #[allow(clippy::too_many_lines)]
 pub fn handle_request(
-    cfg: &Config,
-    caller_uid: u32,
+    ctx: &RequestCtx<'_>,
     approver: &dyn Approver,
     approval_state: &Mutex<ApprovalState>,
     approval_mutex: Option<&Mutex<()>>,
     clock: &dyn Clock,
     req: &Request,
 ) -> Response {
+    let RequestCtx {
+        cfg,
+        bundle,
+        caller_uid,
+    } = ctx;
+    let caller_uid = *caller_uid;
+
     if req.argv.is_empty() {
         audit_best_effort(cfg, caller_uid, req, Outcome::DeniedEmpty);
         return Response::Denied {
@@ -80,7 +198,7 @@ pub fn handle_request(
         };
     }
 
-    let rule_index = match cfg.policy.evaluate(&req.argv) {
+    let rule_index = match bundle.policy.evaluate(&req.argv) {
         Verdict::Denied { reason } => {
             audit_best_effort(cfg, caller_uid, req, Outcome::DeniedPolicy);
             return Response::Denied { why: reason };
@@ -104,7 +222,7 @@ pub fn handle_request(
     }
 
     // Rate limiting: checked before prompting.
-    if scoping::is_rate_limited(approval_state, &cfg.rule_scopes, rule_index, clock) {
+    if scoping::is_rate_limited(approval_state, &bundle.rule_scopes, rule_index, clock) {
         audit_best_effort(cfg, caller_uid, req, Outcome::DeniedRate);
         return Response::Denied {
             why: "rate limit exceeded".into(),
@@ -114,14 +232,14 @@ pub fn handle_request(
     // Cache check: if a fresh approval exists, skip the human dialog.
     match scoping::check_cache(
         approval_state,
-        &cfg.rule_scopes,
+        &bundle.rule_scopes,
         rule_index,
         &req.argv,
         clock,
     ) {
         scoping::CacheVerdict::Hit => {
             // Record the cached execution in the rate window too.
-            scoping::record_cache_hit(approval_state, rule_index, clock);
+            scoping::record_cache_hit(approval_state, &bundle.rule_scopes, rule_index, clock);
             match execute(req, &cwd) {
                 Ok((exit_code, stdout, stderr)) => {
                     audit_best_effort(cfg, caller_uid, req, Outcome::ApprovedCached { exit_code });
@@ -177,7 +295,7 @@ pub fn handle_request(
     // Record the approval for cache and rate tracking.
     scoping::record_approval(
         approval_state,
-        &cfg.rule_scopes,
+        &bundle.rule_scopes,
         rule_index,
         &req.argv,
         clock,
@@ -223,20 +341,38 @@ fn audit_best_effort(cfg: &Config, caller_uid: u32, req: &Request, outcome: Outc
     }
 }
 
-/// Bind the socket and serve connections forever.
+/// Bind the socket, set permissions, and log startup. Used by [`serve`] and
+/// [`serve_with_registry`] to share the bind-and-log logic. The read-lock on
+/// `cfg.current` is scoped to cloning `agent_uids` and dropped before any I/O.
 ///
 /// # Errors
-/// Returns an error only if the socket cannot be bound.
-pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
+/// Returns an error if the socket cannot be bound or permissions cannot be set.
+fn bind_and_log(cfg: &Arc<Config>) -> io::Result<UnixListener> {
+    let agent_uids = {
+        let b = cfg
+            .current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        b.agent_uids.clone()
+    };
     let _stale = std::fs::remove_file(&cfg.socket_path);
     let listener = UnixListener::bind(&cfg.socket_path)?;
     restrict_socket_permissions(&cfg.socket_path)?;
     eprintln!(
         "sudixd: listening on {} (agent uids: {:?})",
         cfg.socket_path.display(),
-        cfg.agent_uids
+        agent_uids
     );
-    serve_on(&listener, cfg, approver)
+    Ok(listener)
+}
+
+/// Bind the socket and serve connections forever.
+///
+/// # Errors
+/// Returns an error only if the socket cannot be bound.
+pub fn serve(cfg: &Arc<Config>, approver: &dyn Approver) -> io::Result<()> {
+    let listener = bind_and_log(cfg)?;
+    serve_on(cfg, &listener, approver)
 }
 
 /// Bind the socket and serve connections forever, using the given registry.
@@ -247,19 +383,12 @@ pub fn serve(cfg: &Config, approver: &dyn Approver) -> io::Result<()> {
 /// # Errors
 /// Returns an error only if the socket cannot be bound.
 pub fn serve_with_registry(
-    cfg: &Config,
+    cfg: &Arc<Config>,
     approver: &dyn Approver,
     registry: &Arc<AgentRegistry>,
 ) -> io::Result<()> {
-    let _stale = std::fs::remove_file(&cfg.socket_path);
-    let listener = UnixListener::bind(&cfg.socket_path)?;
-    restrict_socket_permissions(&cfg.socket_path)?;
-    eprintln!(
-        "sudixd: listening on {} (agent uids: {:?})",
-        cfg.socket_path.display(),
-        cfg.agent_uids
-    );
-    serve_on_with_registry(&listener, cfg, approver, registry)
+    let listener = bind_and_log(cfg)?;
+    serve_on_with_registry(cfg, &listener, approver, registry)
 }
 
 /// Serve connections on an already-bound listener, using the given registry.
@@ -267,25 +396,25 @@ pub fn serve_with_registry(
 /// # Errors
 /// See [`serve_on`].
 pub fn serve_on_with_registry(
+    cfg: &Arc<Config>,
     listener: &UnixListener,
-    cfg: &Config,
     base_approver: &dyn Approver,
     registry: &Arc<AgentRegistry>,
 ) -> io::Result<()> {
     // For the agent path, approval serialization is managed by AgentApprover's
     // own gate — no outer mutex is needed here.
-    serve_on_with_registry_inner(listener, cfg, base_approver, registry, None);
+    serve_on_with_registry_inner(Arc::clone(cfg), listener, base_approver, registry, None);
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn serve_on_with_registry_inner(
+    cfg: Arc<Config>,
     listener: &UnixListener,
-    cfg: &Config,
     base_approver: &dyn Approver,
     registry: &Arc<AgentRegistry>,
     outer_approval_gate: Option<&Arc<Mutex<()>>>,
 ) {
-    let cfg = Arc::new(cfg.clone());
     let base_approver: Arc<dyn Approver> = Arc::from(base_approver.clone_box());
     let state = Arc::new(Mutex::new(ApprovalState::new()));
     // Counting semaphore: limits concurrent threads to MAX_CONCURRENT.
@@ -365,15 +494,21 @@ fn serve_on_with_registry_inner(
 /// Returns an error only if `listener.incoming()` itself fails unrecoverably
 /// (in practice this means the listener was already closed).
 pub fn serve_on(
+    cfg: &Arc<Config>,
     listener: &UnixListener,
-    cfg: &Config,
     base_approver: &dyn Approver,
 ) -> io::Result<()> {
     let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
     // Serializes the blocking human-approval step so at most one dialog is
     // outstanding at a time. AgentApprover manages its own gate internally.
     let gate = Arc::new(Mutex::new(()));
-    serve_on_with_registry_inner(listener, cfg, base_approver, &registry, Some(&gate));
+    serve_on_with_registry_inner(
+        Arc::clone(cfg),
+        listener,
+        base_approver,
+        &registry,
+        Some(&gate),
+    );
     Ok(())
 }
 
@@ -394,8 +529,24 @@ fn handle_connection_threaded(
     registry: &Arc<AgentRegistry>,
     stream: &UnixStream,
 ) -> io::Result<()> {
+    // Reload policy before auth so a reload can update agent_uids too.
+    if let Err(e) = maybe_reload(cfg, state) {
+        let resp = Response::Error {
+            why: format!("config reload failed; request refused: {e}"),
+        };
+        return write_response(stream, &resp);
+    }
+
+    // Snapshot the current bundle for this connection.
+    let bundle: Arc<PolicyBundle> = {
+        cfg.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+
     let caller_uid = peer_uid(stream)?;
-    if !cfg.agent_uids.contains(&caller_uid) {
+    if !bundle.agent_uids.contains(&caller_uid) {
         let resp = Response::Denied {
             why: "caller uid not authorized".into(),
         };
@@ -420,8 +571,11 @@ fn handle_connection_threaded(
     match Hello::from_line(&line) {
         Ok(Hello::Command(req)) => {
             let resp = handle_request(
-                cfg,
-                caller_uid,
+                &RequestCtx {
+                    cfg,
+                    bundle: &bundle,
+                    caller_uid,
+                },
                 base_approver,
                 state,
                 approval_mutex,
@@ -483,27 +637,49 @@ fn write_response(mut stream: &UnixStream, resp: &Response) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::Rule;
-
+    use crate::config::FileConfig;
     use crate::scoping::{ApprovalState, RealClock};
+    use std::io::Write;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn test_cfg(dir: &std::path::Path) -> Config {
-        Config {
-            socket_path: dir.join("sock"),
-            agent_uids: vec![1000],
-            policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
-            rule_scopes: vec![],
-            audit_path: dir.join("audit.log"),
-        }
+    /// Build a minimal `FileConfig` TOML, write to a tempfile, and load it.
+    fn write_config(dir: &std::path::Path, toml: &str) -> std::path::PathBuf {
+        let path = dir.join("policy.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        path
+    }
+
+    fn test_cfg(dir: &std::path::Path) -> Arc<Config> {
+        let config_path = write_config(
+            dir,
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] } ]
+deny  = [ { argv = ["dd", { rest = true }] } ]
+"#,
+        );
+        let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
+        let initial_hash = config::config_hash(&config_path).ok();
+        let bundle = bundle_from_file_cfg(&fc);
+        Arc::new(Config::new(
+            dir.join("sock"),
+            dir.join("audit.log"),
+            ReloadCtx {
+                config_path,
+                enforce_perms: false,
+            },
+            bundle,
+            initial_hash,
+        ))
     }
 
     fn no_scoping() -> std::sync::Mutex<ApprovalState> {
         std::sync::Mutex::new(ApprovalState::new())
     }
 
-    /// Approver that always answers a fixed verdict and counts calls, so we can
-    /// assert it was (or was not) consulted.
+    /// Approver that always answers a fixed verdict and counts calls.
     struct FakeApprover {
         answer: Approval,
         calls: Arc<AtomicU32>,
@@ -548,6 +724,13 @@ mod tests {
         }
     }
 
+    fn bundle(cfg: &Config) -> Arc<PolicyBundle> {
+        cfg.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     #[test]
     fn nonexistent_cwd_denied_before_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -557,9 +740,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -578,7 +765,6 @@ mod tests {
     fn file_as_cwd_denied_before_approval() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path());
-        // Create a regular file to use as "cwd".
         let file_path = dir.path().join("notadir");
         std::fs::write(&file_path, b"x").unwrap();
         let approver = FakeApprover {
@@ -586,9 +772,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -612,9 +802,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -622,7 +816,6 @@ mod tests {
             &req(&["rm", "-rf", "/"]),
         );
         assert!(matches!(resp, Response::Denied { .. }));
-        // The human must never be bothered for a command policy already refused.
         assert_eq!(approver.calls.load(Ordering::Relaxed), 0);
     }
 
@@ -635,9 +828,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -657,9 +854,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -681,9 +882,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -711,9 +916,13 @@ mod tests {
             calls: Arc::new(AtomicU32::new(0)),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &yes,
             &state,
             None,
@@ -721,8 +930,11 @@ mod tests {
             &req(&["echo", "ok"]),
         );
         handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &yes,
             &state,
             None,
@@ -751,9 +963,13 @@ mod tests {
             approval_gate: Arc::new(Mutex::new(())),
         };
         let state = no_scoping();
+        let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -764,5 +980,247 @@ mod tests {
             matches!(resp, Response::Error { .. }),
             "expected Error, got {resp:?}"
         );
+    }
+
+    // --- hot-reload tests ---
+
+    #[test]
+    fn reload_picks_up_new_allow_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_config(
+            dir.path(),
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] } ]
+"#,
+        );
+        let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
+        let initial_hash = config::config_hash(&config_path).ok();
+        let bundle_init = bundle_from_file_cfg(&fc);
+        let cfg = Arc::new(Config::new(
+            dir.path().join("sock"),
+            dir.path().join("audit.log"),
+            ReloadCtx {
+                config_path: config_path.clone(),
+                enforce_perms: false,
+            },
+            bundle_init,
+            initial_hash,
+        ));
+        let state = Arc::new(Mutex::new(ApprovalState::new()));
+
+        // id is not allowed yet.
+        assert!(
+            !bundle(&cfg)
+                .policy
+                .evaluate(&["id"].map(str::to_string))
+                .is_allowed()
+        );
+
+        // Rewrite config to also allow `id`, force reload by clearing last_hash.
+        std::fs::write(
+            &config_path,
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] }, { argv = ["id"] } ]
+"#,
+        )
+        .unwrap();
+        {
+            let mut last = cfg
+                .last_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = None;
+        }
+
+        maybe_reload(&cfg, &state).unwrap();
+        assert!(
+            bundle(&cfg)
+                .policy
+                .evaluate(&["id"].map(str::to_string))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn reload_failure_fails_closed_and_keeps_old_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_config(
+            dir.path(),
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] } ]
+"#,
+        );
+        let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
+        let initial_hash = config::config_hash(&config_path).ok();
+        let bundle_init = bundle_from_file_cfg(&fc);
+        let cfg = Arc::new(Config::new(
+            dir.path().join("sock"),
+            dir.path().join("audit.log"),
+            ReloadCtx {
+                config_path: config_path.clone(),
+                enforce_perms: false,
+            },
+            bundle_init,
+            initial_hash,
+        ));
+        let state = Arc::new(Mutex::new(ApprovalState::new()));
+
+        // Break the config and force a reload.
+        std::fs::write(&config_path, b"this is not valid toml ???").unwrap();
+        {
+            let mut last = cfg
+                .last_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = None;
+        }
+
+        assert!(maybe_reload(&cfg, &state).is_err());
+        // Old policy still intact: echo still allowed.
+        assert!(
+            bundle(&cfg)
+                .policy
+                .evaluate(&["echo", "hi"].map(str::to_string))
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn same_content_skips_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_a = r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] } ]
+"#;
+        let config_path = write_config(dir.path(), config_a);
+        let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
+        let initial_hash = config::config_hash(&config_path).ok();
+        let bundle_init = bundle_from_file_cfg(&fc);
+        let cfg = Arc::new(Config::new(
+            dir.path().join("sock"),
+            dir.path().join("audit.log"),
+            ReloadCtx {
+                config_path: config_path.clone(),
+                enforce_perms: false,
+            },
+            bundle_init,
+            initial_hash,
+        ));
+        let state = Arc::new(Mutex::new(ApprovalState::new()));
+
+        // Seed last_hash = current file hash; id not in config A.
+        let current_hash = config::config_hash(&config_path).ok();
+        {
+            let mut last = cfg
+                .last_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = current_hash;
+        }
+
+        // Fast path: hash matches, no reload even though content is present on disk.
+        maybe_reload(&cfg, &state).unwrap();
+        assert!(
+            !bundle(&cfg)
+                .policy
+                .evaluate(&["id"].map(str::to_string))
+                .is_allowed(),
+            "id must not be allowed — config A has no id rule"
+        );
+
+        // Now change the file to config B (adds id). Hash differs → reload fires.
+        std::fs::write(
+            &config_path,
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] }, { argv = ["id"] } ]
+"#,
+        )
+        .unwrap();
+        maybe_reload(&cfg, &state).unwrap();
+        assert!(
+            bundle(&cfg)
+                .policy
+                .evaluate(&["id"].map(str::to_string))
+                .is_allowed(),
+            "id must be allowed after reload with config B"
+        );
+    }
+
+    #[test]
+    fn approval_state_cleared_on_rule_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_config(
+            dir.path(),
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }], cache_ttl_secs = 300 } ]
+"#,
+        );
+        let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
+        let initial_hash = config::config_hash(&config_path).ok();
+        let bundle_init = bundle_from_file_cfg(&fc);
+        let cfg = Arc::new(Config::new(
+            dir.path().join("sock"),
+            dir.path().join("audit.log"),
+            ReloadCtx {
+                config_path: config_path.clone(),
+                enforce_perms: false,
+            },
+            bundle_init,
+            initial_hash,
+        ));
+        let state = Arc::new(Mutex::new(ApprovalState::new()));
+        let clock = RealClock;
+
+        // Prime a cache entry.
+        scoping::record_approval(
+            &state,
+            &bundle(&cfg).rule_scopes,
+            0,
+            &["echo", "hi"].map(str::to_string),
+            &clock,
+        );
+        assert!(matches!(
+            scoping::check_cache(
+                &state,
+                &bundle(&cfg).rule_scopes,
+                0,
+                &["echo", "hi"].map(str::to_string),
+                &clock,
+            ),
+            scoping::CacheVerdict::Hit
+        ));
+
+        // Force a reload by clearing last_hash (same config content is fine).
+        {
+            let mut last = cfg
+                .last_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = None;
+        }
+        maybe_reload(&cfg, &state).unwrap();
+
+        // Cache must be cleared.
+        assert!(matches!(
+            scoping::check_cache(
+                &state,
+                &bundle(&cfg).rule_scopes,
+                0,
+                &["echo", "hi"].map(str::to_string),
+                &clock,
+            ),
+            scoping::CacheVerdict::Miss
+        ));
     }
 }

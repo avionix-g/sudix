@@ -1,7 +1,8 @@
-//! `sudix` — the thin client a coding agent invokes in place of `sudo`.
+//! `sudix` — request privileged command execution via the sudix broker.
 //!
 //! Usage:
-//!     sudix [--reason "why"] -- <command> [args...]
+//!     sudix [--reason TEXT] [--otp CODE] [--] <command> [args...]
+//!     sudix -h | --help
 //!
 //! It connects to the broker socket, submits the command, and on approval
 //! prints the command's stdout/stderr and exits with its exit code. The client
@@ -13,26 +14,52 @@ use std::process::ExitCode;
 
 use sudix::protocol::{Hello, Request, Response};
 
+const HELP: &str = "\
+sudix — request privileged command execution via the sudix broker.
+
+Usage:
+    sudix [--reason TEXT] [--otp CODE] [--] <command> [args...]
+    sudix -h | --help
+
+Options:
+    --reason TEXT   Human-readable justification shown to the approver.
+    --otp CODE      One-time code (when the broker uses TOTP approval).
+    -h, --help      Show this help and exit.
+
+The command after `--` (or the first non-flag token) is submitted to the
+broker, which gates it through policy + human approval and, if approved,
+runs it as root and relays its output and exit code.
+
+Environment:
+    SUDIX_SOCKET    Broker socket path (default: /run/sudix/sudixd.sock).
+";
+
 struct Args {
     reason: String,
     otp: Option<String>,
     argv: Vec<String>,
 }
 
-/// Parse `[--reason TEXT] [--otp CODE] [--] CMD ARGS...`. The first non-flag
-/// token (or everything after `--`) begins the command.
-fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
+/// Parse `[-h | --help] [--reason TEXT] [--otp CODE] [--] CMD ARGS...`.
+///
+/// Returns `Ok(None)` when `-h`/`--help` is the leading flag (caller prints
+/// help and exits 0). Returns `Ok(Some(args))` on success. Returns `Err` on
+/// invalid input.
+fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let mut reason = "no reason given".to_string();
     let mut otp: Option<String> = None;
     let mut argv = Vec::new();
 
     while let Some(tok) = raw.next() {
         match tok.as_str() {
+            "-h" | "--help" => {
+                return Ok(None);
+            }
             "--reason" => {
-                reason = raw.next().ok_or("--reason requires a value")?;
+                reason = flag_value(&mut raw, "--reason")?;
             }
             "--otp" => {
-                otp = Some(raw.next().ok_or("--otp requires a value")?);
+                otp = Some(flag_value(&mut raw, "--otp")?);
             }
             "--" => {
                 argv.extend(raw.by_ref());
@@ -52,11 +79,24 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Args, String> {
     if argv.is_empty() {
         return Err("no command given".into());
     }
-    Ok(Args { reason, otp, argv })
+    Ok(Some(Args { reason, otp, argv }))
+}
+
+/// Take the value following an option flag. Rejects `--` so it can't be silently
+/// consumed as a value (`sudix --reason -- id` is an error, not "reason == --").
+fn flag_value(raw: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    match raw.next() {
+        Some(v) if v != "--" => Ok(v),
+        Some(_) => Err(format!("{flag} requires a value (got `--`)")),
+        None => Err(format!("{flag} requires a value")),
+    }
 }
 
 fn run() -> Result<i32, String> {
-    let args = parse_args(std::env::args().skip(1))?;
+    let Some(args) = parse_args(std::env::args().skip(1))? else {
+        print!("{HELP}");
+        return Ok(0);
+    };
     let socket_path =
         std::env::var("SUDIX_SOCKET").unwrap_or_else(|_| "/run/sudix/sudixd.sock".into());
 
@@ -121,28 +161,31 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    fn args(parts: &[&str]) -> Result<Args, String> {
+    fn args(parts: &[&str]) -> Result<Option<Args>, String> {
         parse_args(parts.iter().map(|s| (*s).to_string()))
+    }
+
+    fn args_unwrap(parts: &[&str]) -> Args {
+        args(parts).unwrap().unwrap()
     }
 
     #[test]
     fn parses_reason_then_double_dash_command() {
-        let a = args(&["--reason", "install rg", "--", "pacman", "-S", "ripgrep"]).unwrap();
+        let a = args_unwrap(&["--reason", "install rg", "--", "pacman", "-S", "ripgrep"]);
         assert_eq!(a.reason, "install rg");
         assert_eq!(a.argv, vec!["pacman", "-S", "ripgrep"]);
     }
 
     #[test]
     fn bare_command_without_double_dash() {
-        let a = args(&["id"]).unwrap();
+        let a = args_unwrap(&["id"]);
         assert_eq!(a.argv, vec!["id"]);
         assert_eq!(a.reason, "no reason given");
     }
 
     #[test]
     fn flags_after_command_belong_to_the_command() {
-        // Once the command starts, `-S` is the command's flag, not ours.
-        let a = args(&["pacman", "-S", "ripgrep"]).unwrap();
+        let a = args_unwrap(&["pacman", "-S", "ripgrep"]);
         assert_eq!(a.argv, vec!["pacman", "-S", "ripgrep"]);
     }
 
@@ -159,14 +202,14 @@ mod tests {
 
     #[test]
     fn otp_flag_before_command() {
-        let a = args(&["--otp", "123456", "--", "id"]).unwrap();
+        let a = args_unwrap(&["--otp", "123456", "--", "id"]);
         assert_eq!(a.otp, Some("123456".to_string()));
         assert_eq!(a.argv, vec!["id"]);
     }
 
     #[test]
     fn otp_flag_after_double_dash_belongs_to_command() {
-        let a = args(&["--", "myapp", "--otp", "999"]).unwrap();
+        let a = args_unwrap(&["--", "myapp", "--otp", "999"]);
         assert_eq!(a.otp, None);
         assert_eq!(a.argv, vec!["myapp", "--otp", "999"]);
     }
@@ -174,5 +217,36 @@ mod tests {
     #[test]
     fn otp_missing_required_arg_is_an_error() {
         assert!(args(&["--otp"]).is_err());
+    }
+
+    #[test]
+    fn double_dash_is_not_a_flag_value() {
+        // `--` must terminate option parsing, not be swallowed as a value.
+        assert!(args(&["--reason", "--", "id"]).is_err());
+        assert!(args(&["--otp", "--", "id"]).is_err());
+    }
+
+    // --- help flag tests ---
+
+    #[test]
+    fn short_help_flag_returns_none() {
+        assert!(matches!(args(&["-h"]), Ok(None)));
+    }
+
+    #[test]
+    fn long_help_flag_returns_none() {
+        assert!(matches!(args(&["--help"]), Ok(None)));
+    }
+
+    #[test]
+    fn help_after_double_dash_is_command_arg() {
+        let a = args_unwrap(&["--", "myapp", "--help"]);
+        assert_eq!(a.argv, vec!["myapp", "--help"]);
+    }
+
+    #[test]
+    fn help_after_command_start_is_command_arg() {
+        let a = args_unwrap(&["myapp", "--help"]);
+        assert_eq!(a.argv, vec!["myapp", "--help"]);
     }
 }

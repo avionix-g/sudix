@@ -12,10 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use sudix::approval::{Approval, Approver};
-use sudix::policy::{Policy, Rule};
 use sudix::protocol::{Hello, Request, Response};
-use sudix::scoping::RuleScope;
-use sudix::server::{Config, serve};
+use sudix::server::{Config, ReloadCtx, bundle_from_file_cfg, serve};
 
 /// Always-allow approver for the happy path.
 struct AlwaysAllow;
@@ -61,21 +59,43 @@ impl Approver for SlowApprover {
     }
 }
 
-fn spawn_broker(dir: &std::path::Path, agent_uids: Vec<u32>) -> std::path::PathBuf {
-    let socket_path = dir.join("sock");
-    let cfg = Config {
-        socket_path: socket_path.clone(),
-        agent_uids,
-        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
-        rule_scopes: vec![RuleScope {
-            cache_ttl_secs: 0,
-            rate_per_min: 0,
-        }],
-        audit_path: dir.join("audit.log"),
-    };
+/// Write a minimal config file to `dir` and load it, returning the path.
+fn write_config(dir: &std::path::Path, uid: u32) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let path = dir.join("policy.toml");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(
+        f,
+        r#"agent_uids = [{uid}]
+approver_uids = [{uid}]
+deny  = [ {{ argv = ["dd", {{ rest = true }}] }} ]
+allow = [ {{ argv = ["echo", {{ rest = true }}] }} ]"#,
+    )
+    .unwrap();
+    path
+}
+
+fn make_cfg(dir: &std::path::Path, uid: u32) -> Arc<Config> {
+    let config_path = write_config(dir, uid);
+    let fc = sudix::config::FileConfig::load_with_checks(&config_path, false).unwrap();
+    let initial_hash = sudix::config::config_hash(&config_path).ok();
+    let bundle = bundle_from_file_cfg(&fc);
+    Arc::new(Config::new(
+        dir.join("sock"),
+        dir.join("audit.log"),
+        ReloadCtx {
+            config_path,
+            enforce_perms: false,
+        },
+        bundle,
+        initial_hash,
+    ))
+}
+
+fn spawn_broker(dir: &std::path::Path, uid: u32) -> std::path::PathBuf {
+    let cfg = make_cfg(dir, uid);
+    let socket_path = cfg.socket_path.clone();
     thread::spawn(move || {
-        // Static approver lives for the thread's lifetime. `serve` only
-        // returns on a bind error; the test fails via `wait_for_socket` if so.
         let _served = serve(&cfg, &AlwaysAllow);
     });
     wait_for_socket(&socket_path);
@@ -117,7 +137,7 @@ fn req(parts: &[&str]) -> Request {
 fn approved_command_runs_over_the_socket() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket = spawn_broker(dir.path(), vec![uid]);
+    let socket = spawn_broker(dir.path(), uid);
 
     match send(&socket, &req(&["echo", "roundtrip"])) {
         Response::Approved {
@@ -135,7 +155,7 @@ fn approved_command_runs_over_the_socket() {
 fn policy_denied_command_is_refused_over_the_socket() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket = spawn_broker(dir.path(), vec![uid]);
+    let socket = spawn_broker(dir.path(), uid);
 
     assert!(matches!(
         send(&socket, &req(&["rm", "-rf", "/"])),
@@ -145,11 +165,9 @@ fn policy_denied_command_is_refused_over_the_socket() {
 
 #[test]
 fn wrong_uid_is_rejected_before_policy() {
-    // Authorize a uid that is not ours; the broker must refuse our connection
-    // on peer-cred grounds alone, without consulting policy.
     let our_uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket = spawn_broker(dir.path(), vec![our_uid.wrapping_add(1)]);
+    let socket = spawn_broker(dir.path(), our_uid.wrapping_add(1));
 
     match send(&socket, &req(&["echo", "hi"])) {
         Response::Denied { why } => assert!(why.contains("uid")),
@@ -163,6 +181,10 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
     const N: usize = 4;
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
+    let config_path = write_config(dir.path(), uid);
+    let fc = sudix::config::FileConfig::load_with_checks(&config_path, false).unwrap();
+    let initial_hash = sudix::config::config_hash(&config_path).ok();
+    let bundle = bundle_from_file_cfg(&fc);
     let socket_path = dir.path().join("sock");
     let concurrent = Arc::new(AtomicU32::new(0));
     let max_seen = Arc::new(AtomicU32::new(0));
@@ -171,16 +193,16 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
         max_seen: Arc::clone(&max_seen),
     };
 
-    let cfg = Config {
-        socket_path: socket_path.clone(),
-        agent_uids: vec![uid],
-        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
-        rule_scopes: vec![RuleScope {
-            cache_ttl_secs: 0,
-            rate_per_min: 0,
-        }],
-        audit_path: dir.path().join("audit.log"),
-    };
+    let cfg = Arc::new(Config::new(
+        socket_path.clone(),
+        dir.path().join("audit.log"),
+        ReloadCtx {
+            config_path,
+            enforce_perms: false,
+        },
+        bundle,
+        initial_hash,
+    ));
     thread::spawn(move || {
         drop(serve(&cfg, &approver));
     });
@@ -194,12 +216,10 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
         .collect();
     let responses: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-    // All connections should complete successfully.
     for resp in &responses {
         assert!(matches!(resp, Response::Approved { .. }), "got: {resp:?}");
     }
 
-    // Approval is serialized: at most one dialog outstanding at a time.
     assert_eq!(
         max_seen.load(Ordering::SeqCst),
         1,
@@ -211,24 +231,10 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
 fn oversized_request_is_refused_not_buffered() {
     let uid = nix::unistd::getuid().as_raw();
     let dir = tempfile::tempdir().unwrap();
-    let socket_path = dir.path().join("sock");
-
-    let cfg = Config {
-        socket_path: socket_path.clone(),
-        agent_uids: vec![uid],
-        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
-        rule_scopes: vec![],
-        audit_path: dir.path().join("audit.log"),
-    };
-    thread::spawn(move || {
-        drop(serve(&cfg, &AlwaysAllow));
-    });
-    wait_for_socket(&socket_path);
+    let socket = spawn_broker(dir.path(), uid);
 
     // Write 1 MiB of 'x' with no newline — must be denied, not buffered.
-    // The daemon may close the write end after hitting the cap, so broken-pipe
-    // errors on our side are expected and harmless.
-    let mut stream = UnixStream::connect(&socket_path).expect("connect");
+    let mut stream = UnixStream::connect(&socket).expect("connect");
     let payload = vec![b'x'; 1024 * 1024];
     drop(stream.write_all(&payload));
     drop(stream.flush());
@@ -253,22 +259,30 @@ fn spawn_agent_broker(
     std::sync::Arc<sudix::approval::AgentRegistry>,
 ) {
     use std::collections::HashMap;
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
     use sudix::approval::{AgentApprover, AgentRegistry};
     use sudix::server::serve_on_with_registry;
 
+    let config_path = write_config(dir, uid);
+    let fc = sudix::config::FileConfig::load_with_checks(&config_path, false).unwrap();
+    let initial_hash = sudix::config::config_hash(&config_path).ok();
+    let bundle = bundle_from_file_cfg(&fc);
     let socket_path = dir.join("agent_sock");
+
     let registry: Arc<AgentRegistry> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
     let registry2 = Arc::clone(&registry);
     let socket2 = socket_path.clone();
-    let cfg = Config {
-        socket_path: socket_path.clone(),
-        agent_uids: vec![uid],
-        policy: Policy::new(vec![Rule::new(["echo", "**"]).unwrap()], vec!["dd".into()]),
-        rule_scopes: vec![],
-        audit_path: dir.join("agent_audit.log"),
-    };
+    let cfg = Arc::new(Config::new(
+        socket_path.clone(),
+        dir.join("agent_audit.log"),
+        ReloadCtx {
+            config_path,
+            enforce_perms: false,
+        },
+        bundle,
+        initial_hash,
+    ));
     thread::spawn(move || {
         let listener = std::os::unix::net::UnixListener::bind(&socket2).unwrap();
         let approver = AgentApprover {
@@ -277,7 +291,7 @@ fn spawn_agent_broker(
             approval_gate: Arc::new(std::sync::Mutex::new(())),
         };
         drop(serve_on_with_registry(
-            &listener, &cfg, &approver, &registry2,
+            &cfg, &listener, &approver, &registry2,
         ));
     });
     wait_for_socket(&socket_path);
