@@ -17,7 +17,7 @@ options all hand it more than you want:
 `sudix` does not give the agent a credential. The agent **requests** a specific
 command; a root daemon decides:
 
-1. **Policy** (deny-by-default allowlist + non-overridable hard denylist) —
+1. **Policy** (deny-by-default regex allowlist with an explicit deny list) —
    runs server-side, so the agent can't forge it. Denied requests never reach
    the human.
 2. **Approval** — out-of-band (zenity dialog or TOTP code), showing the *exact*
@@ -47,7 +47,7 @@ agent ──unix socket──▶ sudixd (root)
 | Module      | Responsibility                                                     |
 |-------------|--------------------------------------------------------------------|
 | `protocol`  | Newline-delimited JSON wire types (`Request`, `Response`).         |
-| `policy`    | Allowlist matching (`*` = one arg, `**` = rest). The policy gate.  |
+| `policy`    | Regex matching against shell-quoted argv rendering. The policy gate. |
 | `approval`  | `Approver` trait + `ZenityApprover` + `TotpApprover`. Fail-closed. |
 | `scoping`   | Per-rule TTL cache, rate limiting, injectable clock.               |
 | `audit`     | Append-only JSONL log.                                             |
@@ -93,6 +93,27 @@ must be owned by root and not group- or world-writable. Generate a starter:
 sudixd default-config
 ```
 
+The daemon hot-reloads the policy on each incoming request when the file's
+mtime changes — **no restart required** after editing `policy.toml`. If the
+file fails to load (bad TOML, invalid regex), the request is refused and the
+old in-memory policy is kept until the file is fixed.
+
+### Rule format
+
+Rules match a **regex** against a canonical rendering of the requested argv:
+- `argv[0]` is reduced to its basename (`/usr/bin/pacman` → `pacman`), so
+  path-spelling can't dodge a rule.
+- Every token is POSIX shell-quoted; tokens are joined with single spaces.
+  Example: `["rm", "-rf /"]` renders as `rm '-rf /'` (space-containing args
+  are quoted, preventing token-boundary spoofing).
+
+Patterns are **unanchored** by default. `id` matches `id -u` (renders `id -u`).
+Anchor with `^` and `$` to match exactly: `^id$` matches only `["id"]`.
+`.*` is the "match everything" pattern.
+
+**`deny` is evaluated before `allow`.** A command matching any deny rule is
+refused even if an allow rule would also match it.
+
 Key fields:
 
 ```toml
@@ -101,15 +122,23 @@ agent_uids = [1000]
 # UIDs whose presence the approval step is meant to prove.
 approver_uids = [1000]
 
-[approval]
-# "zenity" (desktop dialog) or "totp" (headless).
-method = "zenity"
-# totp_secret_path = "/etc/sudix/totp.key"  # required when method = "totp"
+# Deny rules (optional; checked before allow).
+deny = [
+  { argv = "^(sh|bash)( |$)" },
+]
 
-[[allow]]
-argv = ["pacman", "-S", "**"]
-# cache_ttl_secs = 300  # optional: auto-approve same argv for N seconds
-# rate_per_min   = 10   # optional: max approvals/min (over limit → denied)
+# Allow rules.
+allow = [
+  { argv = "^pacman -S " },
+  { argv = "^id$" },
+  # cache_ttl_secs = 300  # optional: auto-approve same argv for N seconds
+  # rate_per_min   = 10   # optional: max approvals/min (over limit → denied)
+]
+
+[approval]
+# "agent" (desktop GUI via sudix-agent) or "totp" (headless).
+method = "agent"
+# totp_secret_path = "/etc/sudix/totp.key"  # required when method = "totp"
 ```
 
 ## Environment variables
@@ -125,9 +154,13 @@ argv = ["pacman", "-S", "**"]
 Production-hardened. All items from the initial sketch are now implemented:
 
 - Policy loaded from a root-owned TOML config; `sudixd default-config` prints a starter.
+- Hot-reload: policy changes take effect on the next request; no restart needed.
+- Regex rules matched against shell-quoted, basename-normalized argv rendering.
+- Unified `deny`/`allow` rule arrays; deny takes precedence.
 - cwd canonicalized and validated before exec.
 - Per-rule TTL cache, rate limiting, approval caching (server-side; agent can't reach).
-- TOTP headless approval path (`sudixd enroll`); zenity for desktop.
+- TOTP headless approval path (`sudixd enroll`); agent dialog for desktop.
 - Concurrent connections (thread-per-connection + serialized approval gate).
 - systemd unit + socket activation (`dist/systemd/`).
-- Agent vs. approver UID separation; disjoint sets + zenity refused at startup.
+- Agent vs. approver UID separation.
+- `sudix --help` prints usage.

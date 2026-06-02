@@ -85,7 +85,8 @@ Edit `/etc/sudix/policy.toml`:
 - Set `agent_uids` to the uid(s) of the coding agent and the human approver (same uid for a single-user desktop).
 - Set `approver_uids` to the same uid(s).
 - Choose `method = "agent"` (desktop GUI via `sudix-agent`) or `method = "totp"` (headless).
-- Adjust the `[[allow]]` rules and `hard_deny` list.
+- Adjust the `deny` and `allow` regex rule arrays. See the README "Configuration" section for rule syntax.
+- The daemon **hot-reloads** on each request when the file's mtime changes — no `systemctl restart` needed after edits. If the reload fails (bad TOML or invalid regex), that request is refused with an error and the old policy is kept in memory until the file is fixed.
 
 **Security checklist:**
 - Verify the allowlist covers only low-blast-radius commands.
@@ -160,6 +161,7 @@ sudo install -o root -g root -m 755 target/release/sudix-agent /usr/bin/sudix-ag
 For `method = "agent"` (desktop):
 
 ```sh
+sudix --help               # prints usage and exits 0
 sudix -- id
 # sudix-agent shows a zenity dialog; Allow → prints uid info, exit 0
 #                                     Deny  → "sudix: denied: denied by user", exit 126
