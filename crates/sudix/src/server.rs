@@ -147,6 +147,13 @@ pub fn bundle_from_file_cfg(fc: &FileConfig) -> PolicyBundle {
     }
 }
 
+/// Per-connection context snapshot passed to [`handle_request`].
+pub struct RequestCtx<'a> {
+    pub cfg: &'a Config,
+    pub bundle: &'a PolicyBundle,
+    pub caller_uid: u32,
+}
+
 /// Decide and (if approved) execute a request. This is the heart of the broker,
 /// kept free of any socket concerns so it can be unit-tested with a fake
 /// [`Approver`].
@@ -161,17 +168,21 @@ pub fn bundle_from_file_cfg(fc: &FileConfig) -> PolicyBundle {
 /// 3. execution as the daemon's own (root) identity;
 /// 4. audit, regardless of outcome.
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 pub fn handle_request(
-    cfg: &Config,
-    bundle: &PolicyBundle,
-    caller_uid: u32,
+    ctx: &RequestCtx<'_>,
     approver: &dyn Approver,
     approval_state: &Mutex<ApprovalState>,
     approval_mutex: Option<&Mutex<()>>,
     clock: &dyn Clock,
     req: &Request,
 ) -> Response {
+    let RequestCtx {
+        cfg,
+        bundle,
+        caller_uid,
+    } = ctx;
+    let caller_uid = *caller_uid;
+
     if req.argv.is_empty() {
         audit_best_effort(cfg, caller_uid, req, Outcome::DeniedEmpty);
         return Response::Denied {
@@ -330,27 +341,38 @@ fn audit_best_effort(cfg: &Config, caller_uid: u32, req: &Request, outcome: Outc
     }
 }
 
+/// Bind the socket, set permissions, and log startup. Used by [`serve`] and
+/// [`serve_with_registry`] to share the bind-and-log logic. The read-lock on
+/// `cfg.current` is scoped to cloning `agent_uids` and dropped before any I/O.
+///
+/// # Errors
+/// Returns an error if the socket cannot be bound or permissions cannot be set.
+fn bind_and_log(cfg: &Arc<Config>) -> io::Result<UnixListener> {
+    let agent_uids = {
+        let b = cfg
+            .current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        b.agent_uids.clone()
+    };
+    let _stale = std::fs::remove_file(&cfg.socket_path);
+    let listener = UnixListener::bind(&cfg.socket_path)?;
+    restrict_socket_permissions(&cfg.socket_path)?;
+    eprintln!(
+        "sudixd: listening on {} (agent uids: {:?})",
+        cfg.socket_path.display(),
+        agent_uids
+    );
+    Ok(listener)
+}
+
 /// Bind the socket and serve connections forever.
 ///
 /// # Errors
 /// Returns an error only if the socket cannot be bound.
 pub fn serve(cfg: &Arc<Config>, approver: &dyn Approver) -> io::Result<()> {
-    {
-        let bundle = cfg
-            .current
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _stale = std::fs::remove_file(&cfg.socket_path);
-        let listener = UnixListener::bind(&cfg.socket_path)?;
-        restrict_socket_permissions(&cfg.socket_path)?;
-        eprintln!(
-            "sudixd: listening on {} (agent uids: {:?})",
-            cfg.socket_path.display(),
-            bundle.agent_uids
-        );
-        drop(bundle);
-        serve_on(cfg, &listener, approver)
-    }
+    let listener = bind_and_log(cfg)?;
+    serve_on(cfg, &listener, approver)
 }
 
 /// Bind the socket and serve connections forever, using the given registry.
@@ -365,22 +387,8 @@ pub fn serve_with_registry(
     approver: &dyn Approver,
     registry: &Arc<AgentRegistry>,
 ) -> io::Result<()> {
-    {
-        let bundle = cfg
-            .current
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _stale = std::fs::remove_file(&cfg.socket_path);
-        let listener = UnixListener::bind(&cfg.socket_path)?;
-        restrict_socket_permissions(&cfg.socket_path)?;
-        eprintln!(
-            "sudixd: listening on {} (agent uids: {:?})",
-            cfg.socket_path.display(),
-            bundle.agent_uids
-        );
-        drop(bundle);
-        serve_on_with_registry(cfg, &listener, approver, registry)
-    }
+    let listener = bind_and_log(cfg)?;
+    serve_on_with_registry(cfg, &listener, approver, registry)
 }
 
 /// Serve connections on an already-bound listener, using the given registry.
@@ -563,9 +571,11 @@ fn handle_connection_threaded(
     match Hello::from_line(&line) {
         Ok(Hello::Command(req)) => {
             let resp = handle_request(
-                cfg,
-                &bundle,
-                caller_uid,
+                &RequestCtx {
+                    cfg,
+                    bundle: &bundle,
+                    caller_uid,
+                },
                 base_approver,
                 state,
                 approval_mutex,
@@ -732,9 +742,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -762,9 +774,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -790,9 +804,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -814,9 +830,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -838,9 +856,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -864,9 +884,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
@@ -896,9 +918,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &yes,
             &state,
             None,
@@ -906,9 +930,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
             &req(&["echo", "ok"]),
         );
         handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &yes,
             &state,
             None,
@@ -939,9 +965,11 @@ deny  = [ { argv = ["dd", { rest = true }] } ]
         let state = no_scoping();
         let b = bundle(&cfg);
         let resp = handle_request(
-            &cfg,
-            &b,
-            1000,
+            &RequestCtx {
+                cfg: &cfg,
+                bundle: &b,
+                caller_uid: 1000,
+            },
             &approver,
             &state,
             None,
