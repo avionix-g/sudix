@@ -85,8 +85,13 @@ Edit `/etc/sudix/policy.toml`:
 - Set `agent_uids` to the uid(s) of the coding agent and the human approver (same uid for a single-user desktop).
 - Set `approver_uids` to the same uid(s).
 - Choose `method = "agent"` (desktop GUI via `sudix-agent`) or `method = "totp"` (headless).
-- Adjust the `deny` and `allow` regex rule arrays. See the README "Configuration" section for rule syntax.
-- The daemon **hot-reloads** on each request when the file's mtime changes — no `systemctl restart` needed after edits. If the reload fails (bad TOML or invalid regex), that request is refused with an error and the old policy is kept in memory until the file is fixed.
+- Adjust the `deny` and `allow` token-matcher arrays. See the README "Rule format" section for syntax
+  (`"token"` = exact match, `{ re = "…" }` = anchored regex, `{ rest = true }` = trailing tokens).
+- The daemon **hot-reloads** on each request when the file's **contents change** (SHA-256) — no
+  `systemctl restart` needed after edits. Same-content saves are no-ops; the approval cache and
+  rate-limit state survive reloads where the allow rules are unchanged. If the reload fails (bad TOML
+  or invalid rule), that request is refused with an error and the old policy is kept in memory until
+  the file is fixed.
 
 **Security checklist:**
 - Verify the allowlist covers only low-blast-radius commands.
