@@ -64,7 +64,7 @@ fn run_daemon() -> std::io::Result<()> {
 
     let file_cfg = FileConfig::load(&config_path).map_err(|e| Error::other(e.to_string()))?;
 
-    let initial_mtime = config::config_mtime(&config_path).ok();
+    let initial_hash = config::config_hash(&config_path).ok();
 
     let static_approver = approver_for(
         &file_cfg.approval.method,
@@ -95,7 +95,7 @@ fn run_daemon() -> std::io::Result<()> {
             enforce_perms: true,
         },
         bundle,
-        initial_mtime,
+        initial_hash,
     ));
 
     if let Some(approver) = static_approver {

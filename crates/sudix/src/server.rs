@@ -7,7 +7,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::SystemTime;
 
 /// Maximum concurrent connections. Over this, new connections block until a
 /// slot is free. Guards against resource exhaustion at the daemon's expected
@@ -53,46 +52,52 @@ pub struct Config {
     pub reload: ReloadCtx,
     /// Current policy bundle; swapped on successful reload.
     pub current: RwLock<Arc<PolicyBundle>>,
-    /// Last-seen config mtime; `None` means "force a reload on next request".
-    pub last_mtime: Mutex<Option<SystemTime>>,
+    /// SHA-256 of the last-seen config file contents; `None` means "force a
+    /// reload on next request".
+    pub last_hash: Mutex<Option<[u8; 32]>>,
 }
 
 impl Config {
-    /// Construct from a pre-built bundle. `initial_mtime` should come from
-    /// `config_mtime(&config_path)` captured right after the initial load.
+    /// Construct from a pre-built bundle. `initial_hash` should come from
+    /// `config_hash(&config_path)` captured right after the initial load.
     #[must_use]
     pub fn new(
         socket_path: PathBuf,
         audit_path: PathBuf,
         reload: ReloadCtx,
         bundle: PolicyBundle,
-        initial_mtime: Option<SystemTime>,
+        initial_hash: Option<[u8; 32]>,
     ) -> Self {
         Self {
             socket_path,
             audit_path,
             reload,
             current: RwLock::new(Arc::new(bundle)),
-            last_mtime: Mutex::new(initial_mtime),
+            last_hash: Mutex::new(initial_hash),
         }
     }
 }
 
-/// Reload the policy bundle from disk if the file's mtime changed since the
-/// last successful load. On success, swaps in the new bundle and clears
+/// Reload the policy bundle from disk if the file's contents changed since the
+/// last successful load. On success, swaps in the new bundle and resets
 /// approval state (rule indices may have shifted). On failure, leaves the
 /// current bundle intact and returns the error so the caller can fail closed.
+///
+/// Lock ordering: `last_hash` is acquired before `current` and `state` to
+/// prevent deadlock — all callers must follow this order.
 fn maybe_reload(cfg: &Config, state: &Mutex<ApprovalState>) -> Result<(), ConfigError> {
-    let m = config::config_mtime(&cfg.reload.config_path)?;
+    // Read hash outside the lock (cheap I/O, no need to serialize).
+    let h = config::config_hash(&cfg.reload.config_path)?;
 
-    {
-        let last = cfg
-            .last_mtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *last == Some(m) {
-            return Ok(()); // fast path: mtime unchanged
-        }
+    // Hold last_hash across the load to single-flight concurrent reloads.
+    // A second thread that blocked here will see *last == Some(h) and fast-path.
+    let mut last = cfg
+        .last_hash
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if *last == Some(h) {
+        return Ok(()); // fast path: contents unchanged
     }
 
     match FileConfig::load_with_checks(&cfg.reload.config_path, cfg.reload.enforce_perms) {
@@ -111,13 +116,7 @@ fn maybe_reload(cfg: &Config, state: &Mutex<ApprovalState>) -> Result<(), Config
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *guard = ApprovalState::new();
             }
-            {
-                let mut last = cfg
-                    .last_mtime
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *last = Some(m);
-            }
+            *last = Some(h);
             eprintln!(
                 "sudixd: reloaded policy from {}",
                 cfg.reload.config_path.display()
@@ -625,14 +624,6 @@ fn write_response(mut stream: &UnixStream, resp: &Response) -> io::Result<()> {
     stream.flush()
 }
 
-// Verdict helper used only in tests.
-#[cfg(test)]
-impl crate::policy::Verdict {
-    fn is_allowed(&self) -> bool {
-        matches!(self, crate::policy::Verdict::Allowed { .. })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,12 +646,12 @@ mod tests {
             r#"
 agent_uids = [1000]
 approver_uids = [1000]
-allow = [ { argv = "^echo( |$)" } ]
-deny  = [ { argv = "^dd( |$)" } ]
+allow = [ { argv = ["echo", { rest = true }] } ]
+deny  = [ { argv = ["dd", { rest = true }] } ]
 "#,
         );
         let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
-        let initial_mtime = config::config_mtime(&config_path).ok();
+        let initial_hash = config::config_hash(&config_path).ok();
         let bundle = bundle_from_file_cfg(&fc);
         Arc::new(Config::new(
             dir.join("sock"),
@@ -670,7 +661,7 @@ deny  = [ { argv = "^dd( |$)" } ]
                 enforce_perms: false,
             },
             bundle,
-            initial_mtime,
+            initial_hash,
         ))
     }
 
@@ -973,11 +964,11 @@ deny  = [ { argv = "^dd( |$)" } ]
             r#"
 agent_uids = [1000]
 approver_uids = [1000]
-allow = [ { argv = "^echo( |$)" } ]
+allow = [ { argv = ["echo", { rest = true }] } ]
 "#,
         );
         let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
-        let initial_mtime = config::config_mtime(&config_path).ok();
+        let initial_hash = config::config_hash(&config_path).ok();
         let bundle_init = bundle_from_file_cfg(&fc);
         let cfg = Arc::new(Config::new(
             dir.path().join("sock"),
@@ -987,7 +978,7 @@ allow = [ { argv = "^echo( |$)" } ]
                 enforce_perms: false,
             },
             bundle_init,
-            initial_mtime,
+            initial_hash,
         ));
         let state = Arc::new(Mutex::new(ApprovalState::new()));
 
@@ -999,19 +990,19 @@ allow = [ { argv = "^echo( |$)" } ]
                 .is_allowed()
         );
 
-        // Rewrite config to also allow `id`, force reload by clearing last_mtime.
+        // Rewrite config to also allow `id`, force reload by clearing last_hash.
         std::fs::write(
             &config_path,
             r#"
 agent_uids = [1000]
 approver_uids = [1000]
-allow = [ { argv = "^echo( |$)" }, { argv = "^id$" } ]
+allow = [ { argv = ["echo", { rest = true }] }, { argv = ["id"] } ]
 "#,
         )
         .unwrap();
         {
             let mut last = cfg
-                .last_mtime
+                .last_hash
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *last = None;
@@ -1034,11 +1025,11 @@ allow = [ { argv = "^echo( |$)" }, { argv = "^id$" } ]
             r#"
 agent_uids = [1000]
 approver_uids = [1000]
-allow = [ { argv = "^echo( |$)" } ]
+allow = [ { argv = ["echo", { rest = true }] } ]
 "#,
         );
         let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
-        let initial_mtime = config::config_mtime(&config_path).ok();
+        let initial_hash = config::config_hash(&config_path).ok();
         let bundle_init = bundle_from_file_cfg(&fc);
         let cfg = Arc::new(Config::new(
             dir.path().join("sock"),
@@ -1048,7 +1039,7 @@ allow = [ { argv = "^echo( |$)" } ]
                 enforce_perms: false,
             },
             bundle_init,
-            initial_mtime,
+            initial_hash,
         ));
         let state = Arc::new(Mutex::new(ApprovalState::new()));
 
@@ -1056,7 +1047,7 @@ allow = [ { argv = "^echo( |$)" } ]
         std::fs::write(&config_path, b"this is not valid toml ???").unwrap();
         {
             let mut last = cfg
-                .last_mtime
+                .last_hash
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *last = None;
@@ -1073,18 +1064,16 @@ allow = [ { argv = "^echo( |$)" } ]
     }
 
     #[test]
-    fn no_mtime_change_skips_reload() {
+    fn same_content_skips_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = write_config(
-            dir.path(),
-            r#"
+        let config_a = r#"
 agent_uids = [1000]
 approver_uids = [1000]
-allow = [ { argv = "^echo( |$)" } ]
-"#,
-        );
+allow = [ { argv = ["echo", { rest = true }] } ]
+"#;
+        let config_path = write_config(dir.path(), config_a);
         let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
-        let initial_mtime = config::config_mtime(&config_path).ok();
+        let initial_hash = config::config_hash(&config_path).ok();
         let bundle_init = bundle_from_file_cfg(&fc);
         let cfg = Arc::new(Config::new(
             dir.path().join("sock"),
@@ -1094,47 +1083,63 @@ allow = [ { argv = "^echo( |$)" } ]
                 enforce_perms: false,
             },
             bundle_init,
-            initial_mtime,
+            initial_hash,
         ));
         let state = Arc::new(Mutex::new(ApprovalState::new()));
 
-        // Overwrite config with one that allows id too — but do NOT change last_mtime.
-        // The mtime of the file will differ from stored, but we seed last_mtime = current mtime.
-        let current_mtime = config::config_mtime(&config_path).ok();
+        // Seed last_hash = current file hash; id not in config A.
+        let current_hash = config::config_hash(&config_path).ok();
         {
             let mut last = cfg
-                .last_mtime
+                .last_hash
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *last = current_mtime;
+            *last = current_hash;
         }
-        // Overwrite the file content but the mtime from the FS is the same (we just set it).
-        // To truly test "no-reload on same mtime", we can check that a reload forced by
-        // clearing last_mtime DOES reload, but the fast path does NOT.
-        // The fast path: last_mtime == current file mtime → no reload.
+
+        // Fast path: hash matches, no reload even though content is present on disk.
         maybe_reload(&cfg, &state).unwrap();
-        // id was never allowed; if it got reloaded to a config that allows it, test would fail.
         assert!(
             !bundle(&cfg)
                 .policy
                 .evaluate(&["id"].map(str::to_string))
-                .is_allowed()
+                .is_allowed(),
+            "id must not be allowed — config A has no id rule"
+        );
+
+        // Now change the file to config B (adds id). Hash differs → reload fires.
+        std::fs::write(
+            &config_path,
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = ["echo", { rest = true }] }, { argv = ["id"] } ]
+"#,
+        )
+        .unwrap();
+        maybe_reload(&cfg, &state).unwrap();
+        assert!(
+            bundle(&cfg)
+                .policy
+                .evaluate(&["id"].map(str::to_string))
+                .is_allowed(),
+            "id must be allowed after reload with config B"
         );
     }
 
     #[test]
-    fn approval_state_cleared_on_reload() {
+    fn approval_state_cleared_on_rule_change() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = write_config(
             dir.path(),
             r#"
 agent_uids = [1000]
 approver_uids = [1000]
-allow = [ { argv = "^echo( |$)", cache_ttl_secs = 300 } ]
+allow = [ { argv = ["echo", { rest = true }], cache_ttl_secs = 300 } ]
 "#,
         );
         let fc = FileConfig::load_with_checks(&config_path, false).unwrap();
-        let initial_mtime = config::config_mtime(&config_path).ok();
+        let initial_hash = config::config_hash(&config_path).ok();
         let bundle_init = bundle_from_file_cfg(&fc);
         let cfg = Arc::new(Config::new(
             dir.path().join("sock"),
@@ -1144,7 +1149,7 @@ allow = [ { argv = "^echo( |$)", cache_ttl_secs = 300 } ]
                 enforce_perms: false,
             },
             bundle_init,
-            initial_mtime,
+            initial_hash,
         ));
         let state = Arc::new(Mutex::new(ApprovalState::new()));
         let clock = RealClock;
@@ -1168,10 +1173,10 @@ allow = [ { argv = "^echo( |$)", cache_ttl_secs = 300 } ]
             scoping::CacheVerdict::Hit
         ));
 
-        // Force a reload (same config is fine — we just need it to reload).
+        // Force a reload by clearing last_hash (same config content is fine).
         {
             let mut last = cfg
-                .last_mtime
+                .last_hash
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *last = None;

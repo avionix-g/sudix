@@ -68,8 +68,8 @@ fn write_config(dir: &std::path::Path, uid: u32) -> std::path::PathBuf {
         f,
         r#"agent_uids = [{uid}]
 approver_uids = [{uid}]
-deny  = [ {{ argv = "^dd( |$)" }} ]
-allow = [ {{ argv = "^echo( |$)" }} ]"#,
+deny  = [ {{ argv = ["dd", {{ rest = true }}] }} ]
+allow = [ {{ argv = ["echo", {{ rest = true }}] }} ]"#,
     )
     .unwrap();
     path
@@ -78,7 +78,7 @@ allow = [ {{ argv = "^echo( |$)" }} ]"#,
 fn make_cfg(dir: &std::path::Path, uid: u32) -> Arc<Config> {
     let config_path = write_config(dir, uid);
     let fc = sudix::config::FileConfig::load_with_checks(&config_path, false).unwrap();
-    let initial_mtime = sudix::config::config_mtime(&config_path).ok();
+    let initial_hash = sudix::config::config_hash(&config_path).ok();
     let bundle = bundle_from_file_cfg(&fc);
     Arc::new(Config::new(
         dir.join("sock"),
@@ -88,7 +88,7 @@ fn make_cfg(dir: &std::path::Path, uid: u32) -> Arc<Config> {
             enforce_perms: false,
         },
         bundle,
-        initial_mtime,
+        initial_hash,
     ))
 }
 
@@ -183,7 +183,7 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = write_config(dir.path(), uid);
     let fc = sudix::config::FileConfig::load_with_checks(&config_path, false).unwrap();
-    let initial_mtime = sudix::config::config_mtime(&config_path).ok();
+    let initial_hash = sudix::config::config_hash(&config_path).ok();
     let bundle = bundle_from_file_cfg(&fc);
     let socket_path = dir.path().join("sock");
     let concurrent = Arc::new(AtomicU32::new(0));
@@ -201,7 +201,7 @@ fn concurrent_connections_are_handled_concurrently_with_serialized_approval() {
             enforce_perms: false,
         },
         bundle,
-        initial_mtime,
+        initial_hash,
     ));
     thread::spawn(move || {
         drop(serve(&cfg, &approver));
@@ -266,7 +266,7 @@ fn spawn_agent_broker(
 
     let config_path = write_config(dir, uid);
     let fc = sudix::config::FileConfig::load_with_checks(&config_path, false).unwrap();
-    let initial_mtime = sudix::config::config_mtime(&config_path).ok();
+    let initial_hash = sudix::config::config_hash(&config_path).ok();
     let bundle = bundle_from_file_cfg(&fc);
     let socket_path = dir.join("agent_sock");
 
@@ -281,7 +281,7 @@ fn spawn_agent_broker(
             enforce_perms: false,
         },
         bundle,
-        initial_mtime,
+        initial_hash,
     ));
     thread::spawn(move || {
         let listener = std::os::unix::net::UnixListener::bind(&socket2).unwrap();

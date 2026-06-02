@@ -24,7 +24,7 @@ nix.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-shlex.workspace = true
+sha2.workspace = true
 toml.workspace = true
 totp-rs.workspace = true
 
