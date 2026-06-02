@@ -21,22 +21,14 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "cannot read config: {e}"),
-            Self::Parse(e) => write!(f, "config parse error: {e}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Parse(e) => write!(f, "parse error: {e}"),
             Self::Invalid(msg) => write!(f, "invalid config: {msg}"),
         }
     }
 }
 
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Parse(e) => Some(e),
-            Self::Invalid(_) => None,
-        }
-    }
-}
+impl std::error::Error for ConfigError {}
 
 impl From<std::io::Error> for ConfigError {
     fn from(e: std::io::Error) -> Self {
@@ -44,17 +36,11 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TOML schema
-// ---------------------------------------------------------------------------
-
-/// Approval method selector.
+/// Which human-approval mechanism the daemon uses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMethod {
-    /// Per-user agent in the graphical session (`sudix-agent`).
     Agent,
-    /// Headless TOTP code in the request.
     Totp,
 }
 
@@ -77,15 +63,19 @@ impl Default for ApprovalConfig {
     }
 }
 
-/// A single allow rule entry in the config file.
-///
-/// Supports both the concise inline-array form (`["pacman", "-S", "**"]`) and
-/// the table form (`{ argv = ["pacman", "-S", "**"], cache_ttl_secs = 300 }`).
+/// A single deny rule entry: just a regex pattern.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DenyEntry {
+    pub argv: String,
+}
+
+/// A single allow rule entry with optional scoping knobs.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowEntry {
-    /// The argv token pattern, e.g. `["pacman", "-S", "**"]`.
-    pub argv: Vec<String>,
+    /// Regex pattern matched against the shell-quoted, basename-normalized argv rendering.
+    pub argv: String,
     /// After one approval, auto-approve the identical argv for this many
     /// seconds. `0` (the default) means always prompt.
     #[serde(default)]
@@ -100,10 +90,11 @@ pub struct AllowEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
+    /// Deny rules (evaluated before allow). Absent = empty list.
+    #[serde(default)]
+    pub deny: Vec<DenyEntry>,
     /// Allow rules.
     pub allow: Vec<AllowEntry>,
-    /// Hard-denied program basenames.
-    pub hard_deny: Vec<String>,
     /// UIDs permitted to submit requests (agent service accounts).
     pub agent_uids: Vec<u32>,
     /// UIDs whose live presence the approval step is meant to prove.
@@ -112,10 +103,6 @@ pub struct FileConfig {
     #[serde(default)]
     pub approval: ApprovalConfig,
 }
-
-// ---------------------------------------------------------------------------
-// Loading
-// ---------------------------------------------------------------------------
 
 impl FileConfig {
     /// Load and validate the config from `path`.
@@ -145,11 +132,14 @@ impl FileConfig {
         Self::load_with_checks(path, true)
     }
 
-    /// Validate rule semantics (e.g. `**` placement) and return errors with
-    /// their rule index so the operator can locate the offending line quickly.
+    /// Validate rule semantics and return errors with their rule index.
     fn validate(&self) -> Result<(), ConfigError> {
+        for (i, entry) in self.deny.iter().enumerate() {
+            Rule::new(&entry.argv)
+                .map_err(|e| ConfigError::Invalid(format!("deny rule {i}: {e}")))?;
+        }
         for (i, entry) in self.allow.iter().enumerate() {
-            Rule::new(entry.argv.iter().map(String::as_str))
+            Rule::new(&entry.argv)
                 .map_err(|e| ConfigError::Invalid(format!("allow rule {i}: {e}")))?;
         }
 
@@ -179,12 +169,17 @@ impl FileConfig {
     /// this is called.
     #[must_use]
     pub fn build_policy(&self) -> Policy {
+        let deny = self
+            .deny
+            .iter()
+            .map(|e| Rule::new(&e.argv).expect("already validated"))
+            .collect();
         let allow = self
             .allow
             .iter()
-            .map(|e| Rule::new(e.argv.iter().map(String::as_str)).expect("already validated"))
+            .map(|e| Rule::new(&e.argv).expect("already validated"))
             .collect();
-        Policy::new(allow, self.hard_deny.clone())
+        Policy::new(deny, allow)
     }
 
     /// Return the scoping parameters (ttl, rate) for each allow rule in order.
@@ -197,9 +192,13 @@ impl FileConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Permission check
-// ---------------------------------------------------------------------------
+/// Return the mtime of `path` for reload comparisons.
+///
+/// # Errors
+/// Propagates any `std::io::Error` from `metadata`.
+pub fn config_mtime(path: &Path) -> std::io::Result<std::time::SystemTime> {
+    std::fs::metadata(path)?.modified()
+}
 
 /// Refuse to trust a config file that is group- or world-writable, or not
 /// owned by root. A world-writable policy file is a privilege-escalation hole.
@@ -222,12 +221,7 @@ fn check_file_permissions(path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Starter config
-// ---------------------------------------------------------------------------
-
-/// Return a TOML string that exactly reproduces the compiled-in default
-/// policy. This is the source of truth; `default-config` prints this.
+/// Return a TOML string for the default policy. `default-config` prints this.
 #[must_use]
 pub fn default_config_toml() -> String {
     r#"# sudix policy — generated by `sudixd default-config`
@@ -235,57 +229,52 @@ pub fn default_config_toml() -> String {
 # This file must be owned by root and not group- or world-writable.
 #   sudo chown root:root /etc/sudix/policy.toml
 #   sudo chmod 644 /etc/sudix/policy.toml   # or 640; not 666/664
+#
+# Rules match a REGEX (Rust `regex` crate syntax) against a rendered command
+# string: argv[0] is reduced to its basename, every token is shell-quoted, and
+# the tokens are joined with single spaces. Example renderings:
+#   /usr/bin/pacman -S ripgrep   ->  pacman -S ripgrep
+#   rm "-rf /"                    ->  rm '-rf /'
+#
+# Patterns are UNANCHORED: `id` also matches `id -u` (renders "id -u").
+# Anchor with ^ and $ to match an exact command, e.g. "^id$".
+# `.*` matches everything — use it for an explicit allow-all or deny-all.
+#
+# deny is checked first and OVERRIDES allow.
 
-# Programs refused regardless of allow rules. Extend as needed.
-hard_deny = [
-  "sh", "bash", "zsh", "fish",
-  "dd", "mkfs", "fdisk", "parted",
-  "tee", "chmod", "chown",
-  "visudo", "su", "sudo",
-  "env",
-  "vi", "vim", "nano",
-  "python", "perl",
+# Programs/commands refused regardless of allow rules.
+deny = [
+  { argv = "^(sh|bash|zsh|fish)( |$)" },
+  { argv = "^(dd|mkfs|fdisk|parted)( |$)" },
+  { argv = "^(tee|chmod|chown)( |$)" },
+  { argv = "^(visudo|su|sudo)( |$)" },
+  { argv = "^env( |$)" },
+  { argv = "^(vi|vim|nano)( |$)" },
+  { argv = "^(python|perl)( |$)" },
 ]
 
 # Replace 1000 with the uid(s) of the agent and the human approver.
-# For a single-user desktop deployment both lists contain the same uid.
 agent_uids    = [1000]
 approver_uids = [1000]
+
+# Allow rules. Optional per-rule scoping (both default to 0 = off):
+#   cache_ttl_secs = 300   # auto-approve identical argv for N seconds after one approval
+#   rate_per_min   = 10    # max executions/min; over limit → denied
+allow = [
+  { argv = "^pacman -S " },
+  { argv = "^pacman -Syu( |$)" },
+  { argv = "^systemctl status \\S+$" },
+  { argv = "^systemctl restart \\S+$" },
+  { argv = "^id$" },
+]
 
 [approval]
 # "agent" (per-user sudix-agent in the graphical session) or "totp" (headless).
 method = "agent"
 # totp_secret_path = "/etc/sudix/totp.key"   # required when method = "totp"
-
-# Allow rules. Each entry must have an `argv` token list. The first token is
-# the program basename; `*` matches one argument; `**` matches zero-or-more
-# trailing arguments (only valid as the last token).
-#
-# Optional per-rule scoping knobs (both default to 0 = "off"):
-#   cache_ttl_secs = 300   # auto-approve same exact argv for N seconds after one approval
-#   rate_per_min   = 10    # max approvals/min; over limit → denied (never auto-approved)
-
-[[allow]]
-argv = ["pacman", "-S", "**"]
-
-[[allow]]
-argv = ["pacman", "-Syu", "**"]
-
-[[allow]]
-argv = ["systemctl", "status", "*"]
-
-[[allow]]
-argv = ["systemctl", "restart", "*"]
-
-[[allow]]
-argv = ["id"]
 "#
     .to_string()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -304,7 +293,6 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(toml.as_bytes()).unwrap();
         drop(f);
-        // Use enforce_perms=false so tests can run unprivileged.
         FileConfig::load_with_checks(&path, false)
     }
 
@@ -312,15 +300,14 @@ mod tests {
     fn round_trip_allow_deny() {
         let cfg = load_str(
             r#"
-hard_deny = ["dd"]
+deny = [ { argv = "^dd( |$)" } ]
 agent_uids = [1000]
 approver_uids = [1000]
 
-[[allow]]
-argv = ["pacman", "-S", "**"]
-
-[[allow]]
-argv = ["id"]
+allow = [
+  { argv = "^pacman -S " },
+  { argv = "^id$" },
+]
 "#,
         )
         .unwrap();
@@ -344,15 +331,45 @@ argv = ["id"]
     }
 
     #[test]
-    fn misplaced_double_star_is_invalid() {
-        let err = load_str(
+    fn deny_overrides_allow_when_in_both() {
+        let cfg = load_str(
             r#"
-hard_deny = []
+deny = [ { argv = "^id$" } ]
 agent_uids = [1000]
 approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
+"#,
+        )
+        .unwrap();
+        let policy = cfg.build_policy();
+        assert!(matches!(
+            policy.evaluate(&["id"].map(str::to_string)),
+            Verdict::Denied { .. }
+        ));
+    }
 
-[[allow]]
-argv = ["pacman", "**", "-S"]
+    #[test]
+    fn invalid_deny_regex_is_config_error() {
+        let err = load_str(
+            r#"
+deny = [ { argv = "(unclosed" } ]
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("deny rule 0"), "expected rule index in: {msg}");
+    }
+
+    #[test]
+    fn invalid_allow_regex_is_config_error() {
+        let err = load_str(
+            r#"
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = "(unclosed" } ]
 "#,
         )
         .unwrap_err();
@@ -364,16 +381,32 @@ argv = ["pacman", "**", "-S"]
     }
 
     #[test]
+    fn deny_all_denies_otherwise_allowed() {
+        let cfg = load_str(
+            r#"
+deny = [ { argv = ".*" } ]
+agent_uids = [1000]
+approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
+"#,
+        )
+        .unwrap();
+        let policy = cfg.build_policy();
+        assert!(matches!(
+            policy.evaluate(&["id"].map(str::to_string)),
+            Verdict::Denied { .. }
+        ));
+    }
+
+    #[test]
     fn unknown_key_is_a_parse_error() {
         let err = load_str(
             r#"
-hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
 bogus_key = true
 
-[[allow]]
-argv = ["id"]
+allow = [ { argv = "^id$" } ]
 "#,
         )
         .unwrap_err();
@@ -389,12 +422,10 @@ argv = ["id"]
     #[test]
     fn default_config_parses_and_matches_old_policy() {
         let toml = default_config_toml();
-        // Must parse without error.
         let cfg: FileConfig = toml::from_str(&toml).expect("default config must parse");
         cfg.validate().expect("default config must validate");
         let policy = cfg.build_policy();
 
-        // Allowed by old compiled policy.
         assert!(matches!(
             policy.evaluate(&argv(&["pacman", "-S", "rg"])),
             Verdict::Allowed { .. }
@@ -403,7 +434,7 @@ argv = ["id"]
             policy.evaluate(&argv(&["id"])),
             Verdict::Allowed { .. }
         ));
-        // Denied by hard denylist.
+        // Denied by deny list.
         assert!(matches!(
             policy.evaluate(&argv(&["bash", "-c", "rm -rf /"])),
             Verdict::Denied { .. }
@@ -419,15 +450,12 @@ argv = ["id"]
     fn zenity_method_no_longer_parses() {
         let err = load_str(
             r#"
-hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
 
 [approval]
 method = "zenity"
-
-[[allow]]
-argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -438,15 +466,12 @@ argv = ["id"]
     fn agent_method_parses() {
         load_str(
             r#"
-hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
 
 [approval]
 method = "agent"
-
-[[allow]]
-argv = ["id"]
 "#,
         )
         .unwrap();
@@ -456,16 +481,13 @@ argv = ["id"]
     fn totp_method_parses() {
         let cfg = load_str(
             r#"
-hard_deny = []
 agent_uids = [2000]
 approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
 
 [approval]
 method = "totp"
 totp_secret_path = "/etc/sudix/totp.key"
-
-[[allow]]
-argv = ["id"]
 "#,
         )
         .unwrap();
@@ -476,15 +498,12 @@ argv = ["id"]
     fn totp_method_without_secret_path_is_invalid() {
         let err = load_str(
             r#"
-hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
 
 [approval]
 method = "totp"
-
-[[allow]]
-argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -499,15 +518,12 @@ argv = ["id"]
     fn bad_method_string_is_parse_error() {
         let err = load_str(
             r#"
-hard_deny = []
 agent_uids = [1000]
 approver_uids = [1000]
+allow = [ { argv = "^id$" } ]
 
 [approval]
 method = "pigeons"
-
-[[allow]]
-argv = ["id"]
 "#,
         )
         .unwrap_err();
@@ -520,10 +536,9 @@ argv = ["id"]
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"hard_deny=[]\nagent_uids=[1000]\napprover_uids=[1000]\n")
+        f.write_all(b"agent_uids=[1000]\napprover_uids=[1000]\nallow=[{argv=\"^id$\"}]\n")
             .unwrap();
         drop(f);
-        // Make it world-writable.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         let err = FileConfig::load_with_checks(&path, true).unwrap_err();
         let msg = err.to_string();
