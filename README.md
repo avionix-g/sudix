@@ -97,8 +97,8 @@ The daemon hot-reloads the policy on each incoming request when the file's
 **contents change** (detected by SHA-256) — **no restart required** after
 editing `policy.toml`. If the file fails to load (bad TOML, invalid rule),
 the request is refused and the old in-memory policy is kept until the file is
-fixed. Saving the file with identical content is a no-op; the approval cache
-and rate-limit state are preserved when the allow rules are unchanged.
+fixed. Saving the file with identical content is a no-op (detected by SHA-256);
+any change in content resets the approval cache and rate-limit state.
 
 ### Rule format
 
@@ -165,7 +165,7 @@ Production-hardened. All items from the initial sketch are now implemented:
 
 - Policy loaded from a root-owned TOML config; `sudixd default-config` prints a starter.
 - Hot-reload: policy changes take effect on the next request (SHA-256 content check); no restart needed.
-  Identical-content saves are no-ops; allow-unchanged reloads preserve the approval cache and rate state.
+  Identical-content saves are no-ops; any content change resets the approval cache and rate state.
 - Per-token rules: literal / anchored-regex / rest; deny takes precedence.
 - Unified `deny`/`allow` rule arrays; deny takes precedence.
 - cwd canonicalized and validated before exec.

@@ -239,7 +239,7 @@ pub fn handle_request(
     ) {
         scoping::CacheVerdict::Hit => {
             // Record the cached execution in the rate window too.
-            scoping::record_cache_hit(approval_state, rule_index, clock);
+            scoping::record_cache_hit(approval_state, &bundle.rule_scopes, rule_index, clock);
             match execute(req, &cwd) {
                 Ok((exit_code, stdout, stderr)) => {
                     audit_best_effort(cfg, caller_uid, req, Outcome::ApprovedCached { exit_code });

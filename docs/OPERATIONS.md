@@ -88,8 +88,8 @@ Edit `/etc/sudix/policy.toml`:
 - Adjust the `deny` and `allow` token-matcher arrays. See the README "Rule format" section for syntax
   (`"token"` = exact match, `{ re = "…" }` = anchored regex, `{ rest = true }` = trailing tokens).
 - The daemon **hot-reloads** on each request when the file's **contents change** (SHA-256) — no
-  `systemctl restart` needed after edits. Same-content saves are no-ops; the approval cache and
-  rate-limit state survive reloads where the allow rules are unchanged. If the reload fails (bad TOML
+  `systemctl restart` needed after edits. Same-content saves are no-ops; any change in content
+  resets the approval cache and rate-limit state. If the reload fails (bad TOML
   or invalid rule), that request is refused with an error and the old policy is kept in memory until
   the file is fixed.
 

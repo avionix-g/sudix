@@ -155,8 +155,7 @@ pub fn record_approval(
         guard.cache.insert((rule_index, argv.to_vec()), now);
     }
 
-    // Always record in the rate window (even if rate_per_min = 0; harmless).
-    guard.rate.entry(rule_index).or_default().push_back(now);
+    note_execution(&mut guard, scopes, rule_index, now);
 }
 
 /// Record a cache-hit execution in the rate-limit window.
@@ -164,12 +163,33 @@ pub fn record_approval(
 /// `rate_per_min` limits *executions*, not just human approvals. Cache hits
 /// bypass the approver but are still counted so the operator's configured
 /// rate cap applies to all executions uniformly.
-pub fn record_cache_hit(state: &Mutex<ApprovalState>, rule_index: usize, clock: &dyn Clock) {
+pub fn record_cache_hit(
+    state: &Mutex<ApprovalState>,
+    scopes: &[RuleScope],
+    rule_index: usize,
+    clock: &dyn Clock,
+) {
     let now = clock.now();
     let mut guard = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.rate.entry(rule_index).or_default().push_back(now);
+    note_execution(&mut guard, scopes, rule_index, now);
+}
+
+/// Record an execution in the rate-limit window — but only for rules that have
+/// a rate cap. Rules with `rate_per_min = 0` are never pruned (the prune loop
+/// lives behind the `limit == 0` early-return in [`is_rate_limited`]), so
+/// pushing to their window would leak unboundedly.
+fn note_execution(
+    guard: &mut ApprovalState,
+    scopes: &[RuleScope],
+    rule_index: usize,
+    now: Instant,
+) {
+    let rate = scopes.get(rule_index).map_or(0, |s| s.rate_per_min);
+    if rate > 0 {
+        guard.rate.entry(rule_index).or_default().push_back(now);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +344,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_rate_rule_does_not_accumulate_timestamps() {
+        // A rule with a cache TTL but no rate cap must not grow its rate window:
+        // is_rate_limited never prunes a zero-limit rule, so any push leaks.
+        let state = Mutex::new(ApprovalState::new());
+        let scopes = scopes(60, 0); // ttl > 0, rate = 0
+        let (clock, _offset) = FakeClock::new();
+        let args = argv(&["id"]);
+
+        for _ in 0..100 {
+            record_approval(&state, &scopes, 0, &args, &clock);
+            record_cache_hit(&state, &scopes, 0, &clock);
+        }
+
+        let guard = state.lock().unwrap();
+        assert!(
+            guard.rate.get(&0).is_none_or(VecDeque::is_empty),
+            "zero-rate rule must not buffer timestamps"
+        );
+    }
+
+    #[test]
     fn cache_hits_count_toward_rate_limit() {
         // TTL > 0 so the cache stays warm; rate = 1 so the second execution is over limit.
         let state = Mutex::new(ApprovalState::new());
@@ -340,7 +381,7 @@ mod tests {
             check_cache(&state, &scopes, 0, &args, &clock),
             CacheVerdict::Hit
         ));
-        record_cache_hit(&state, 0, &clock);
+        record_cache_hit(&state, &scopes, 0, &clock);
 
         // Second cache hit: rate budget exhausted — must be rate-limited now.
         assert!(is_rate_limited(&state, &scopes, 0, &clock));

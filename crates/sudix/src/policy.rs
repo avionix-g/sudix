@@ -181,7 +181,9 @@ impl Policy {
     /// Evaluate a request's argv against the policy.
     ///
     /// Pipeline:
-    /// 1. Empty argv → `Denied`.
+    /// 1. Empty argv → `Denied`. (`handle_request` already rejects empty argv
+    ///    before reaching here; this layer repeats the check so it stays sound
+    ///    for callers that invoke it directly, e.g. unit tests.)
     /// 2. Any token contains a control character → `Denied`.
     /// 3. First matching deny rule → `Denied` with rule index and description.
     /// 4. First matching allow rule → `Allowed { rule_index }`.

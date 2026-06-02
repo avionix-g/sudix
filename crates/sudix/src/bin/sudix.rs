@@ -56,10 +56,10 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
                 return Ok(None);
             }
             "--reason" => {
-                reason = raw.next().ok_or("--reason requires a value")?;
+                reason = flag_value(&mut raw, "--reason")?;
             }
             "--otp" => {
-                otp = Some(raw.next().ok_or("--otp requires a value")?);
+                otp = Some(flag_value(&mut raw, "--otp")?);
             }
             "--" => {
                 argv.extend(raw.by_ref());
@@ -80,6 +80,16 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Result<Option<Args>, Str
         return Err("no command given".into());
     }
     Ok(Some(Args { reason, otp, argv }))
+}
+
+/// Take the value following an option flag. Rejects `--` so it can't be silently
+/// consumed as a value (`sudix --reason -- id` is an error, not "reason == --").
+fn flag_value(raw: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    match raw.next() {
+        Some(v) if v != "--" => Ok(v),
+        Some(_) => Err(format!("{flag} requires a value (got `--`)")),
+        None => Err(format!("{flag} requires a value")),
+    }
 }
 
 fn run() -> Result<i32, String> {
@@ -207,6 +217,13 @@ mod tests {
     #[test]
     fn otp_missing_required_arg_is_an_error() {
         assert!(args(&["--otp"]).is_err());
+    }
+
+    #[test]
+    fn double_dash_is_not_a_flag_value() {
+        // `--` must terminate option parsing, not be swallowed as a value.
+        assert!(args(&["--reason", "--", "id"]).is_err());
+        assert!(args(&["--otp", "--", "id"]).is_err());
     }
 
     // --- help flag tests ---
