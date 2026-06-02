@@ -290,7 +290,11 @@ pub fn default_config_toml() -> String {
 # deny is checked first and OVERRIDES allow.
 # Arguments containing control characters (newline, tab, etc.) are always refused.
 
-# Programs/commands refused regardless of allow rules.
+# Replace 1000 with the uid(s) of the agent and the human approver.
+agent_uids    = [1000]
+approver_uids = [1000]
+
+# Deny rules. Overrides allow rules.
 deny = [
   { argv = [{ re = "sh|bash|zsh|fish" }, { rest = true }] },
   { argv = [{ re = "dd|mkfs|fdisk|parted" }, { rest = true }] },
@@ -301,18 +305,12 @@ deny = [
   { argv = [{ re = "python|perl" }, { rest = true }] },
 ]
 
-# Replace 1000 with the uid(s) of the agent and the human approver.
-agent_uids    = [1000]
-approver_uids = [1000]
-
 # Allow rules. Optional per-rule scoping (both default to 0 = off):
 #   cache_ttl_secs = 300   # auto-approve identical argv for N seconds after one approval
 #   rate_per_min   = 10    # max executions/min; over limit → denied
 allow = [
-  { argv = ["pacman", "-S", { rest = true }] },
-  { argv = ["pacman", "-Syu", { rest = true }] },
-  { argv = ["systemctl", "status", { re = "\\S+" }] },
-  { argv = ["systemctl", "restart", { re = "\\S+" }] },
+  # { argv = ["systemctl", "status", { re = "\\S+" }] },
+  # { argv = ["systemctl", "restart", { re = "\\S+" }] },
   { argv = ["id"] },
 ]
 
@@ -554,21 +552,12 @@ allow = [ { argv = ["id"] } ]
     }
 
     #[test]
-    fn default_config_parses_and_matches_old_policy() {
+    fn default_config_parses() {
         let toml = default_config_toml();
         let cfg: FileConfig = toml::from_str(&toml).expect("default config must parse");
         cfg.validate().expect("default config must validate");
         let policy = cfg.build_policy();
 
-        assert!(matches!(
-            policy.evaluate(&argv(&["pacman", "-S", "rg"])),
-            Verdict::Allowed { .. }
-        ));
-        // pacman -S with zero packages: Rest matches zero trailing tokens
-        assert!(matches!(
-            policy.evaluate(&argv(&["pacman", "-S"])),
-            Verdict::Allowed { .. }
-        ));
         assert!(matches!(
             policy.evaluate(&argv(&["id"])),
             Verdict::Allowed { .. }
