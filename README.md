@@ -1,177 +1,177 @@
 # sudix
 
-A privileged-action broker for coding agents.
+**Let a coding agent run `sudo` safely.**
 
-## Problem
+Your coding agent sometimes needs root: install a package, restart a service, edit a system file. The usual fixes are bad: a `NOPASSWD` sudoers line hands it unbounded, unattended root, and a stored password gives it a reusable root credential the moment it gets one approval.
 
-A coding agent running under your user account sometimes needs root. The usual
-options all hand it more than you want:
+sudix is built for exactly this. The agent doesn't get a credential-- it **asks** for one specific command, and you approve or deny that command with a single click. Approval covers that one command. The agent never sees a password and never gets a root shell.
 
-- `NOPASSWD` sudoers → unattended, unbounded root.
-- A stored password → after one approval the agent holds a reusable root
-  credential, and the checks guarding it (cwd, parent-process name, env vars)
-  are forgeable *by the agent*.
+![sudix approval prompt over a terminal](docs/screenshot.png)
 
-## Approach
+## How it works
 
-`sudix` does not give the agent a credential. The agent **requests** a specific
-command; a root daemon decides:
+sudix runs a small root daemon (the **broker**). Your agent runs `sudix` instead of `sudo`. The broker:
 
-1. **Policy** (deny-by-default regex allowlist with an explicit deny list) —
-   runs server-side, so the agent can't forge it. Denied requests never reach
-   the human.
-2. **Approval** — out-of-band (zenity dialog or TOTP code), showing the *exact*
-   command. Fails closed: any error, timeout, or "Deny" rejects.
-3. **Execution** — the daemon runs the approved `argv` directly (no shell) as
-   root and returns stdout/stderr/exit-code.
-4. **Audit** — every decision is appended to a root-owned JSONL log.
+1. **Checks policy** on a deny-by-default allowlist you control. Denied requests never bother you.
+2. **Asks you** Pops up a desktop dialog (or a TOTP code, headless) showing the exact command. Any timeout or error means *deny*.
+3. **Runs it** as root and returns the output.
+4. **Logs** every decision.
 
-Approval authorizes **one command**, not a session. The agent never sees a
-password and never gets a root shell.
+### Why a broker, not a wrapper
 
-```
-agent ──unix socket──▶ sudixd (root)
-                          │ SO_PEERCRED: caller uid in agent_uids?
-                          │ policy: argv matches an allow rule?
-                          │ cwd: canonicalize + exist + is_dir?
-                          │ rate limit: within per-rule limit?
-                          │ cache: recently approved same argv? (optional TTL)
-                          │ approval: human approves THIS command?
-                          │ execute argv as root
-                          │ append audit line
-                          └─▶ {exit_code, stdout, stderr}
-```
+Tools like [sudoplz](https://github.com/crypdick/sudoplz) wrap `sudo` on the *client* side: the agent's own process decides whether to proceed, and any guard it checks (working directory, parent process, environment) is forgeable by the agent. sudix moves the decision to a **separate root process** the agent can't influence. The agent can only send a request over a socket; policy, approval, and execution all happen on the other side of that boundary. One approval authorizes one command, not a session.
 
-## Layout
+## Install
 
-| Module      | Responsibility                                                     |
-|-------------|--------------------------------------------------------------------|
-| `protocol`  | Newline-delimited JSON wire types (`Request`, `Response`).         |
-| `policy`    | Per-token matching (literal / anchored-regex / rest). The policy gate. |
-| `approval`  | `Approver` trait + `ZenityApprover` + `TotpApprover`. Fail-closed. |
-| `scoping`   | Per-rule TTL cache, rate limiting, injectable clock.               |
-| `audit`     | Append-only JSONL log.                                             |
-| `config`    | Load + validate `/etc/sudix/policy.toml`.                          |
-| `server`    | Socket loop, peer-cred auth, decision pipeline, concurrency.       |
-
-Binaries: `sudixd` (the daemon) and `sudix` (the thin client).
-
-## Quick start
-
-See [docs/OPERATIONS.md](docs/OPERATIONS.md) for full install/config/release instructions.
-
-1. **Build:**
-   ```sh
-   cargo build --release
-   ```
-
-2. **Generate a starter config:**
-   ```sh
-   sudo mkdir -p /etc/sudix
-   sudo sudixd default-config > /etc/sudix/policy.toml
-   sudo chown root:root /etc/sudix/policy.toml
-   sudo chmod 644 /etc/sudix/policy.toml
-   # Edit agent_uids / approver_uids to your uid(s).
-   ```
-
-3. **Run the daemon:**
-   ```sh
-   sudo SUDIX_RUNTIME_DIR=/run/sudix sudixd
-   ```
-
-4. **Submit a request:**
-   ```sh
-   sudix --reason "install ripgrep" -- pacman -S --noconfirm ripgrep
-   ```
-
-## Configuration
-
-Policy lives in `/etc/sudix/policy.toml` (override: `$SUDIX_CONFIG`). The file
-must be owned by root and not group- or world-writable. Generate a starter:
+Requires Rust 1.95+, [`just`](https://github.com/casey/just), and `zenity` (for the desktop prompt). Then:
 
 ```sh
-sudixd default-config
+just install
 ```
 
-The daemon hot-reloads the policy on each incoming request when the file's
-**contents change** (detected by SHA-256) — **no restart required** after
-editing `policy.toml`. If the file fails to load (bad TOML, invalid rule),
-the request is refused and the old in-memory policy is kept until the file is
-fixed. Saving the file with identical content is a no-op (detected by SHA-256);
-any change in content resets the approval cache and rate-limit state.
+This builds release binaries, installs them to `/usr/bin`, writes a starter `/etc/sudix/policy.toml` (if absent), installs the systemd units, and starts the broker plus the per-user approval agent.
 
-### Rule format
+Edit `/etc/sudix/policy.toml` (see below) and you're done.
 
-A rule's `argv` is an ordered list of **token-matchers**, one per shell token:
+To remove everything: `just uninstall`.
 
-| Matcher form       | Meaning                                                              |
-|--------------------|----------------------------------------------------------------------|
-| `"token"`          | Exact match for one token (`argv[0]` matched by basename)            |
-| `{ re = "…" }`     | One token matched by an anchored regex — sudix wraps it as `^(?:…)$` |
-| `{ rest = true }`  | Zero or more trailing tokens; valid only as the last element         |
+## Configure
 
-- `argv[0]` is basename-normalized (`/usr/bin/pacman` → `pacman`), so
-  path-spelling can't dodge a rule.
-- Regex patterns are **anchored automatically**. Write `\S+` to match one
-  whitespace-free token; no `^`/`$` needed.
-- A literal `"..."` argument is just `"..."` — no special meaning.
-- **`deny` is evaluated before `allow`.** A command matching any deny rule is
-  refused even if an allow rule would also match it.
-- Arguments containing control characters (newline, tab, NUL, …) are always
-  refused, regardless of rules.
+Policy lives in `/etc/sudix/policy.toml` (root-owned, not world-writable). The daemon **hot-reloads** it whenever the contents change. A broken file is refused and the previous policy stays in effect.
 
-Key fields:
+### Policy schema
+
+|Field |Where |Meaning |
+|-|-|-|
+|`agent_uids` |top level |uids allowed to submit requests (your agent's account). |
+|`approver_uids` |top level |uids whose approval is accepted. |
+|`deny` |top level |rules refused outright. **Checked before `allow`**. |
+|`allow` |top level |rules that may be approved. |
+|`cache_ttl_secs` |per allow rule |auto-approve identical argv for N seconds (default 0=off).|
+|`rate_per_min` |per allow rule |max executions/min; over the limit → denied (0=off). |
+|`method` |`[approval]` |`"agent"` (desktop) or `"totp"` (headless). |
+|`totp_secret_path` |`[approval]` |secret file path; required when `method = "totp"`. |
+
+A rule's `argv` is an ordered list of **token-matchers**, one per command token:
+
+|Matcher |Matches |
+|-|-|
+|`"git"` |exactly that token (`argv[0]` is matched by basename). |
+|`{ re = "…" }` |one token, by regex. Anchored automatically (`\S+` = one token).|
+|`{ rest = true }`|zero or more trailing tokens; only valid as the last element. |
+
+Commands with control characters (newline, tab, NUL) are always refused.
+
+### Examples
 
 ```toml
-# UIDs allowed to submit requests (agent service accounts).
-agent_uids = [1000]
-# UIDs whose presence the approval step is meant to prove.
+# Allow installing packages, with any package args:
+{ argv = ["pacman", "-S", { rest = true }] }
+
+# Allow `systemctl restart <one-token>`:
+{ argv = ["systemctl", "restart", { re = "\\S+" }] }
+
+# Allow a single fixed command:
+{ argv = ["id"] }
+
+# Auto-approve repeats of the exact command for 5 minutes after one OK:
+{ argv = ["pacman", "-Syu"], cache_ttl_secs = 300 }
+```
+
+**Allow everything** (you approve each command, but nothing is pre-denied):
+
+```toml
+allow = [{ argv = [{ rest = true }] }]
+```
+
+### Default config
+
+`sudixd default-config` prints this:
+
+```toml
+# sudix policy -- generated by `sudix default-config`
+#
+# This file must be owned by root and not group- or world-writable.
+#   sudo chown root:root /etc/sudix/policy.toml
+#   sudo chmod 644 /etc/sudix/policy.toml   # or 640; not 666/664
+#
+# Each rule's `argv` is an ordered list of token-matchers:
+#   "token"         bare string: exact match for one token (argv[0] by basename)
+#   { re = "…" }    one token matched by an anchored regex (you write the inner
+#                     pattern; sudix anchors it automatically: \S+ matches one
+#                     whitespace-free token)
+#   { rest = true } zero or more trailing tokens; valid only as the last element
+#
+# allow-all:              argv = [{ rest = true }]
+# program with any args:  argv = ["prog", { rest = true }]
+#
+# deny is checked first and OVERRIDES allow.
+# Arguments containing control characters (newline, tab, etc.) are always refused.
+
+# Replace 1000 with the UID(s) of the agent and the human approver.
+agent_uids    = [1000]
 approver_uids = [1000]
 
-# Deny rules (optional; checked before allow).
+# Deny rules. Overrides allow rules.
 deny = [
-  { argv = [{ re = "sh|bash" }, { rest = true }] },
+  { argv = [{ re = "sh|bash|zsh|fish" }, { rest = true }] },
+  { argv = [{ re = "dd|mkfs|fdisk|parted" }, { rest = true }] },
+  { argv = [{ re = "tee|chmod|chown" }, { rest = true }] },
+  { argv = [{ re = "visudo|su|sudo" }, { rest = true }] },
+  { argv = ["env", { rest = true }] },
+  { argv = [{ re = "vi|vim|nano" }, { rest = true }] },
+  { argv = [{ re = "python|perl" }, { rest = true }] },
 ]
 
-# Allow rules.
+# Allow rules. Optional per-rule scoping (both default to 0 = off):
+#   cache_ttl_secs = 300   # auto-approve identical argv for N seconds after one approval
+#   rate_per_min   = 10    # max executions/min; over limit → denied
 allow = [
-  { argv = ["pacman", "-S", { rest = true }] },
-  { argv = ["systemctl", "status", { re = "\\S+" }] },
+  # { argv = ["systemctl", "status", { re = "\\S+" }] },
+  # { argv = ["systemctl", "restart", { re = "\\S+" }] },
   { argv = ["id"] },
-  # cache_ttl_secs = 300  # optional: auto-approve same argv for N seconds
-  # rate_per_min   = 10   # optional: max approvals/min (over limit → denied)
 ]
 
 [approval]
-# "agent" (desktop GUI via sudix-agent) or "totp" (headless).
+# "agent" (per-user sudix-agent in the graphical session) or "totp" (headless).
 method = "agent"
-# totp_secret_path = "/etc/sudix/totp.key"  # required when method = "totp"
+# totp_secret_path = "/etc/sudix/totp.key"   # required when method = "totp"
 ```
 
-**allow-all:** `argv = [{ rest = true }]` — matches any non-empty argv.
-**program with any args:** `argv = ["prog", { rest = true }]`.
+## Usage
 
-## Environment variables
+Point your agent at `sudix` instead of `sudo`:
 
-| Variable          | Component | Default                   | Purpose                    |
-|-------------------|-----------|---------------------------|----------------------------|
-| `SUDIX_CONFIG`    | daemon    | `/etc/sudix/policy.toml`  | Config file path           |
-| `SUDIX_RUNTIME_DIR` | both    | `/run/sudix`              | Socket + audit log dir     |
-| `SUDIX_SOCKET`    | client    | `/run/sudix/sudixd.sock`  | Override socket path       |
+```sh
+sudix --reason "install ripgrep" -- pacman -S --noconfirm ripgrep
+```
 
-## Status
+A dialog shows you the exact command; approve or deny. The command runs as root
+only if you approve.
 
-Production-hardened. All items from the initial sketch are now implemented:
+## TOTP (headless)
 
-- Policy loaded from a root-owned TOML config; `sudixd default-config` prints a starter.
-- Hot-reload: policy changes take effect on the next request (SHA-256 content check); no restart needed.
-  Identical-content saves are no-ops; any content change resets the approval cache and rate state.
-- Per-token rules: literal / anchored-regex / rest; deny takes precedence.
-- Unified `deny`/`allow` rule arrays; deny takes precedence.
-- cwd canonicalized and validated before exec.
-- Per-rule TTL cache, rate limiting, approval caching (server-side; agent can't reach).
-- TOTP headless approval path (`sudixd enroll`); agent dialog for desktop.
-- Concurrent connections (thread-per-connection + serialized approval gate).
-- systemd unit + socket activation (`dist/systemd/`).
-- Agent vs. approver UID separation.
-- `sudix --help` prints usage.
+On a machine with no graphical session, approve with a one-time code instead of
+a dialog. In `/etc/sudix/policy.toml`:
+
+```toml
+[approval]
+method = "totp"
+totp_secret_path = "/etc/sudix/totp.key"
+```
+
+Enroll once and scan the printed `otpauth://` URI with an authenticator app:
+
+```sh
+sudixd enroll  # add --force to regenerate (invalidates old devices)
+```
+
+Then pass the current code with each request:
+
+```sh
+sudix --otp 123456 -- id
+```
+
+## More
+
+Developer setup, architecture, and release details: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
